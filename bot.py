@@ -6,6 +6,8 @@ to this little web app. It saves the message, and any chart image, into
 Supabase. The SDX dashboard reads from the same table and shows it live.
 """
 import html
+import json
+import math
 import os
 import re
 from datetime import datetime, timezone
@@ -437,3 +439,109 @@ async def coach(request: Request):
         r.raise_for_status()
         reply = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
         return {"reply": reply.strip()}
+
+
+# ---------- SDX scanners: TradingView alerts -> Supabase + Telegram topics ----------
+SCANNER_BOT_TOKEN = os.environ.get("SCANNER_BOT_TOKEN", "")
+SCANNER_KEY = os.environ.get("SCANNER_KEY", "")
+SCANNER_CHAT_ID = os.environ.get("SCANNER_CHAT_ID", "-1004453278644")
+SCANNER_TG = f"https://api.telegram.org/bot{SCANNER_BOT_TOKEN}"
+
+# scanner name -> (dashboard id, Telegram topic)
+SCANNERS = {
+    "SDX Pulse": ("chrome", 17),
+    "SDX Sniper": ("platinum", 15),
+    "SDX Fortress": ("titanium", 11),
+    "SDX Phantom": ("obsidian", 6),
+    "SDX Raid": ("cobalt", 4),
+    "SDX Leviathan": ("iridium", 2),
+}
+
+
+def _tf(tf: str) -> str:
+    tf = str(tf)
+    if tf.isdigit():
+        m = int(tf)
+        return f"H{m // 60}" if m >= 60 and m % 60 == 0 else f"M{m}"
+    return tf.upper()
+
+
+def _fmt(x: float, pip: float) -> str:
+    tick = pip / 10 if pip else 0.00001
+    dec = max(0, round(-math.log10(tick))) if tick < 1 else 0
+    return f"{x:.{dec}f}"
+
+
+def _r(x: float) -> str:
+    return f"{x:.1f}".rstrip("0").rstrip(".")
+
+
+def scanner_text(ev: str, d: dict, name: str) -> str:
+    pip = float(d.get("pip") or 0) or 0.0001
+    e, sl, tp, rf = (float(d[k]) for k in ("entry", "sl", "tp", "rf"))
+    side = d["side"].upper()
+    if ev == "new":
+        order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
+        return (f"{name} | {_tf(d['tf'])}\n\n{d['symbol']} {side} {order}\n\n@{_fmt(e, pip)}\n\n"
+                f"SL {_fmt(sl, pip)} ( {round(abs(e - sl) / pip)} pips )\n\n"
+                f"TP {_fmt(tp, pip)} ( {round(abs(tp - e) / pip)} pips )\n\n"
+                f"Risk free point @ {_fmt(rf, pip)}")
+    if ev == "rf":
+        return f"Risk free point hit ✅\n\nMove SL to {_fmt(e, pip)} ( entry )"
+    if ev == "tp":
+        return f"Take Profit Hit ✅\n\n+{_r(abs(tp - e) / abs(e - sl))}R Secured on this position"
+    if ev == "be":
+        return "Breakeven hit - No P/L secured"
+    if ev == "sl":
+        return "SL HIT -1R ❌"
+    if ev == "cancel":
+        return "Setup cancelled - remove the limit order"
+    return ""
+
+
+@app.post("/scanner")
+async def scanner(request: Request):
+    raw = await request.body()
+    try:
+        d = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad_json")
+    if not SCANNER_KEY or d.get("key") != SCANNER_KEY:
+        raise HTTPException(status_code=403)
+    name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
+    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel") or not sid:
+        raise HTTPException(status_code=400, detail="bad_signal")
+    dash_id, topic = SCANNERS[name]
+    hdr = {**SB_HEADERS, "Content-Type": "application/json"}
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers=SB_HEADERS,
+                                 params={"setup_id": f"eq.{sid}", "select": "*"})).json()
+        row = rows[0] if rows else None
+        if ev == "new" and row:
+            return {"ok": True, "note": "duplicate"}
+
+        msg = {"chat_id": SCANNER_CHAT_ID, "message_thread_id": topic, "text": scanner_text(ev, d, name)}
+        if row and row.get("tg_msg"):
+            msg["reply_parameters"] = {"message_id": row["tg_msg"], "allow_sending_without_reply": True}
+        tg_msg = None
+        if SCANNER_BOT_TOKEN:
+            sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
+            tg_msg = (sent.get("result") or {}).get("message_id")
+
+        if ev == "new":
+            await client.post(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
+                              json={"scanner": dash_id, "symbol": d["symbol"], "tf": _tf(d["tf"]), "side": d["side"],
+                                    "entry": float(d["entry"]), "sl": float(d["sl"]), "tp": float(d["tp"]),
+                                    "rf": float(d["rf"]), "status": "triggered" if d.get("order", "now") == "now" else "waiting",
+                                    "setup_id": sid, "tg_msg": tg_msg})
+        else:
+            patch = {"updated_at": now}
+            if ev == "rf":
+                patch["rf_hit"] = True
+            else:
+                patch["status"] = {"tp": "tp", "sl": "sl", "be": "be", "cancel": "cancelled"}[ev]
+            await client.patch(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
+                               params={"setup_id": f"eq.{sid}"}, json=patch)
+    return {"ok": True}
