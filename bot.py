@@ -451,10 +451,10 @@ SCANNER_TG = f"https://api.telegram.org/bot{SCANNER_BOT_TOKEN}"
 SCANNERS = {
     "SDX Pulse": ("chrome", 17),
     "SDX Sniper": ("platinum", 15),
-    "SDX Fortress": ("titanium", 11),
+    "SDX Precision": ("titanium", 11),
     "SDX Phantom": ("obsidian", 6),
     "SDX Raid": ("cobalt", 4),
-    "SDX Leviathan": ("iridium", 2),
+    "SDX Ghost": ("iridium", 2),
 }
 
 
