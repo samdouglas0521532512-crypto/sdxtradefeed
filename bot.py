@@ -488,6 +488,44 @@ async def admin_access(request: Request):
         return {"ok": True}
 
 
+@app.post("/admin/import-elite")
+async def admin_import_elite(request: Request):
+    """Give dashboard access to people who bought the Elite Pack before the Kajabi webhook was set up."""
+    body = await request.json()
+    people = body.get("people") or []
+    if not isinstance(people, list) or len(people) > 5000:
+        raise HTTPException(status_code=400, detail="bad_list")
+    async with httpx.AsyncClient(timeout=60) as client:
+        me = await current_member(request, client)
+        if me["member"].get("plan") != "Admin":
+            raise HTTPException(status_code=403, detail="admins_only")
+        existing = await sb_all(client, "members", {"select": "email,plan,active"})
+        by_email = {(m.get("email") or "").lower(): m for m in existing}
+        added, already, revoked, bad, rows = [], [], [], [], []
+        seen = set()
+        for p in people:
+            email = str((p or {}).get("email") or "").strip().lower()
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or email in seen:
+                if email and email not in seen:
+                    bad.append(email)
+                continue
+            seen.add(email)
+            m = by_email.get(email)
+            if m and m.get("plan") in ("Admin", "Elite Pack"):
+                (revoked if m.get("active") is False else already).append(email)
+                continue
+            name = str((p or {}).get("name") or "").strip() or email.split("@")[0]
+            rows.append({"email": email, "name": name, "plan": "Elite Pack", "active": True})
+            added.append(email)
+        for i in range(0, len(rows), 500):
+            r = await client.post(f"{SUPABASE_URL}/rest/v1/members", params={"on_conflict": "email"},
+                                  headers={**SB_HEADERS, "Content-Type": "application/json",
+                                           "Prefer": "resolution=merge-duplicates,return=minimal"},
+                                  json=rows[i:i + 500])
+            r.raise_for_status()
+        return {"added": added, "already": already, "revoked": revoked, "bad": bad}
+
+
 # ---------- Kajabi: Elite Pack purchases ----------
 def _find(obj, key):
     if isinstance(obj, dict):
