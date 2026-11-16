@@ -663,6 +663,24 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
     pip = float(d.get("pip") or 0) or 0.0001
     e, sl, tp, rf = (float(d[k]) for k in ("entry", "sl", "tp", "rf"))
     side = d["side"].upper()
+    multi = all(k in d for k in ("tp1", "tp2", "tp3"))
+    if ev == "new" and multi:
+        order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
+        t1, t2, t3 = (float(d[k]) for k in ("tp1", "tp2", "tp3"))
+        return (f"{name} | {_tf(d['tf'])}\n\n{d['symbol']} {side} {order}\n\n@{_fmt(e, pip)}\n\n"
+                f"SL {_fmt(sl, pip)} ( {round(abs(e - sl) / pip)} pips )\n\n"
+                f"TP1 {_fmt(t1, pip)} ( {round(abs(t1 - e) / pip)} pips )\n"
+                f"TP2 {_fmt(t2, pip)} ( {round(abs(t2 - e) / pip)} pips )\n"
+                f"TP3 {_fmt(t3, pip)} ( {round(abs(t3 - e) / pip)} pips )\n\n"
+                f"Close 1/3 at each TP. SL to entry at TP1")
+    if ev == "tp1":
+        return f"TP1 hit ✅\n\nClose 1/3 and move SL to {_fmt(e, pip)} ( entry )"
+    if ev == "tp2":
+        return "TP2 hit ✅\n\nClose another 1/3, let the rest run to TP3"
+    if ev == "tp3":
+        return f"TP3 hit ✅\n\nAll targets hit, +{_r(float(d.get('r') or 0))}R Secured on this position"
+    if ev == "be" and d.get("r") is not None:
+        return f"Rest of the position closed at entry ✅\n\n+{_r(float(d['r']))}R Secured on this position"
     if ev == "new":
         order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
         return (f"{name} | {_tf(d['tf'])}\n\n{d['symbol']} {side} {order}\n\n@{_fmt(e, pip)}\n\n"
@@ -692,7 +710,7 @@ async def scanner(request: Request):
     if not SCANNER_KEY or d.get("key") != SCANNER_KEY:
         raise HTTPException(status_code=403)
     name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
-    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel") or not sid:
+    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3") or not sid:
         raise HTTPException(status_code=400, detail="bad_signal")
     dash_id, topic = SCANNERS[name]
     hdr = {**SB_HEADERS, "Content-Type": "application/json"}
@@ -721,10 +739,10 @@ async def scanner(request: Request):
                                     "setup_id": sid, "tg_msg": tg_msg})
         else:
             patch = {"updated_at": now}
-            if ev == "rf":
+            if ev in ("rf", "tp1"):
                 patch["rf_hit"] = True
-            else:
-                patch["status"] = {"tp": "tp", "sl": "sl", "be": "be", "cancel": "cancelled"}[ev]
+            elif ev != "tp2":
+                patch["status"] = {"tp": "tp", "tp3": "tp", "sl": "sl", "be": "be", "cancel": "cancelled"}[ev]
             await client.patch(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
                                params={"setup_id": f"eq.{sid}"}, json=patch)
     return {"ok": True}
