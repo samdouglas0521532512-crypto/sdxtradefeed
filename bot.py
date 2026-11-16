@@ -312,7 +312,152 @@ async def admin_members(request: Request):
             m["start_balance"] = float(start) if start is not None else None
             m["balance"] = round(bal, 2) if bal is not None else None
             m["signals_logged"] = len(logs_by_user.get(uid, {}))
+        await add_activity(client, rows, users, id_by_email)
         return {"members": rows}
+
+
+async def sb_all(client: httpx.AsyncClient, table: str, params: dict) -> list:
+    """Read every row of a table, 1000 at a time."""
+    out, start = [], 0
+    while True:
+        r = await client.get(f"{SUPABASE_URL}/rest/v1/{table}", headers={**SB_HEADERS, "Range": f"{start}-{start + 999}"},
+                             params=params)
+        if r.status_code >= 400:
+            return out
+        batch = r.json()
+        out += batch
+        if len(batch) < 1000:
+            return out
+        start += 1000
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+async def add_activity(client: httpx.AsyncClient, rows: list, users: list, id_by_email: dict) -> None:
+    """Logins, journal use, trades, videos and scanner requests for each member (admin overview)."""
+    user_by_id = {u["id"]: u for u in users}
+    items = await sb_all(client, "journal_items", {"select": "id,user_id,kind,created_at,updated_at,r:data->>r,done:data->>done"})
+    reqs = await sb_all(client, "journal_items", {"select": "id,user_id,data,created_at", "kind": "eq.scanreq"})
+    trades = await sb_all(client, "journal_trades", {"select": "*"})
+    logs = await sb_all(client, "signal_logs", {"select": "user_id,created_at"})
+    per = {}
+
+    def bump(uid, at):
+        p = per.setdefault(uid, {"entries": 0, "videos": 0, "trades": 0, "wins": 0, "losses": 0, "r": 0.0, "last": None})
+        if at and (p["last"] is None or at > p["last"]):
+            p["last"] = at
+        return p
+
+    for it in items:
+        p = bump(it["user_id"], it.get("updated_at") or it.get("created_at"))
+        k = it.get("kind") or ""
+        if k == "video":
+            if str(it.get("done")).lower() == "true":
+                p["videos"] += 1
+        elif k != "scanreq":
+            p["entries"] += 1
+        if k in ("t:live", "t:futures"):
+            r = _num(it.get("r"))
+            if r is not None:
+                p["trades"] += 1
+                if r > 0:
+                    p["wins"] += 1
+                elif r < 0:
+                    p["losses"] += 1
+                p["r"] += r
+    for t in trades:
+        p = bump(t.get("user_id"), t.get("updated_at") or t.get("created_at"))
+        r = _num(t.get("r"))
+        if r is not None:
+            p["trades"] += 1
+            if r > 0:
+                p["wins"] += 1
+            elif r < 0:
+                p["losses"] += 1
+            p["r"] += r
+    for l in logs:
+        bump(l.get("user_id"), l.get("created_at"))
+    req_by_user = {}
+    for q in reqs:
+        d = q.get("data") or {}
+        req_by_user.setdefault(q["user_id"], []).append({
+            "id": q["id"], "scanner": d.get("scanner"), "name": d.get("name"), "tv": d.get("tv"),
+            "status": d.get("status") or "requested", "at": d.get("at") or q.get("created_at")})
+    for m in rows:
+        uid = id_by_email.get((m.get("email") or "").lower())
+        u = user_by_id.get(uid) or {}
+        p = per.get(uid) or {}
+        m["user_id"] = uid
+        m["last_sign_in"] = u.get("last_sign_in_at")
+        m["last_activity"] = max([x for x in (p.get("last"), u.get("last_sign_in_at")) if x], default=None)
+        m["journal_entries"] = p.get("entries", 0)
+        m["videos_watched"] = p.get("videos", 0)
+        m["trades"] = p.get("trades", 0)
+        m["wins"] = p.get("wins", 0)
+        m["losses"] = p.get("losses", 0)
+        m["total_r"] = round(p.get("r", 0.0), 2)
+        m["scanner_requests"] = req_by_user.get(uid, [])
+
+
+@app.get("/admin/student")
+async def admin_student(request: Request, user_id: str):
+    """One student's recent journal trades and logged signals, for the admin detail view."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await current_member(request, client)
+        if me["member"].get("plan") != "Admin":
+            raise HTTPException(status_code=403, detail="admins_only")
+        trades = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_trades", headers=SB_HEADERS,
+                                   params={"user_id": f"eq.{user_id}", "select": "*"})).json()
+        live = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"user_id": f"eq.{user_id}", "kind": "in.(t:live,t:futures)",
+                                         "select": "kind,data,created_at"})).json()
+        videos = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                   params={"user_id": f"eq.{user_id}", "kind": "eq.video", "select": "data"})).json()
+        kinds = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                  params={"user_id": f"eq.{user_id}", "select": "kind"})).json()
+        out = []
+        for t in trades if isinstance(trades, list) else []:
+            out.append({"date": t.get("trade_date") or t.get("created_at"), "pair": t.get("pair"), "side": t.get("side"),
+                        "setup": t.get("setup"), "r": _num(t.get("r"))})
+        for x in live if isinstance(live, list) else []:
+            d = x.get("data") or {}
+            out.append({"date": d.get("opened") or x.get("created_at"), "pair": d.get("pair"), "side": d.get("position"),
+                        "setup": d.get("setup") or ("Futures" if x["kind"] == "t:futures" else "Live"), "r": _num(d.get("r"))})
+        out.sort(key=lambda t: str(t.get("date") or ""), reverse=True)
+        sections = {}
+        for k in kinds if isinstance(kinds, list) else []:
+            kk = k.get("kind") or ""
+            if kk not in ("video", "scanreq"):
+                sections[kk] = sections.get(kk, 0) + 1
+        return {"trades": out[:30], "videos": [{"file": (v.get("data") or {}).get("v"), "done": bool((v.get("data") or {}).get("done"))}
+                                                for v in videos if isinstance(videos, list)],
+                "sections": sections}
+
+
+@app.post("/admin/scanner-request")
+async def admin_scanner_request(request: Request):
+    body = await request.json()
+    status = body.get("status")
+    if status not in ("added", "removed", "requested"):
+        raise HTTPException(status_code=400, detail="bad_status")
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await current_member(request, client)
+        if me["member"].get("plan") != "Admin":
+            raise HTTPException(status_code=403, detail="admins_only")
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{body.get('id', '')}", "kind": "eq.scanreq", "select": "id,data"})).json()
+        if not rows:
+            raise HTTPException(status_code=404, detail="not_found")
+        data = {**(rows[0].get("data") or {}), "status": status,
+                "handled_at": datetime.now(timezone.utc).isoformat()}
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**SB_HEADERS, "Content-Type": "application/json"},
+                           params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+        return {"ok": True, "data": data}
 
 
 @app.post("/admin/access")
