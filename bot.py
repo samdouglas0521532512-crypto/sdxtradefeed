@@ -664,6 +664,21 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
     e, sl, tp, rf = (float(d[k]) for k in ("entry", "sl", "tp", "rf"))
     side = d["side"].upper()
     multi = all(k in d for k in ("tp1", "tp2", "tp3"))
+    two = not multi and all(k in d for k in ("tp1", "tp2"))
+    if two:
+        part = int(float(d.get("part1") or 50))
+        if ev == "new":
+            order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
+            t1, t2 = float(d["tp1"]), float(d["tp2"])
+            return (f"{name} | {_tf(d['tf'])}\n\n{d['symbol']} {side} {order}\n\n@{_fmt(e, pip)}\n\n"
+                    f"SL {_fmt(sl, pip)} ( {round(abs(e - sl) / pip)} pips )\n\n"
+                    f"TP1 {_fmt(t1, pip)} ( {round(abs(t1 - e) / pip)} pips )\n"
+                    f"TP2 {_fmt(t2, pip)} ( {round(abs(t2 - e) / pip)} pips )\n\n"
+                    f"Close {part}% at TP1 and move SL to entry. Let the rest run to TP2")
+        if ev == "tp1":
+            return f"TP1 hit ✅\n\nClose {part}% and move SL to {_fmt(e, pip)} ( entry )"
+        if ev == "tp2":
+            return f"TP2 hit ✅\n\nAll targets hit, +{_r(float(d.get('r') or 0))}R Secured on this position"
     if ev == "new" and multi:
         order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
         t1, t2, t3 = (float(d[k]) for k in ("tp1", "tp2", "tp3"))
@@ -741,8 +756,10 @@ async def scanner(request: Request):
             patch = {"updated_at": now}
             if ev in ("rf", "tp1"):
                 patch["rf_hit"] = True
-            elif ev != "tp2":
-                patch["status"] = {"tp": "tp", "tp3": "tp", "sl": "sl", "be": "be", "cancel": "cancelled"}[ev]
+            elif ev == "tp2" and not ("tp1" in d and "tp2" in d and "tp3" not in d):
+                pass
+            else:
+                patch["status"] = {"tp": "tp", "tp2": "tp", "tp3": "tp", "sl": "sl", "be": "be", "cancel": "cancelled"}[ev]
             await client.patch(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
                                params={"setup_id": f"eq.{sid}"}, json=patch)
     return {"ok": True}
