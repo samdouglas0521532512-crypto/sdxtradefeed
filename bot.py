@@ -1188,3 +1188,34 @@ async def scanner_summary(key: str = "", kind: str = "day", preview: int = 0):
         return {"ok": True, "text": summary_text(kind, now, rows)}
     _POSTED.add((kind, now.date()))  # so the automatic one doesn't post it again tonight
     return await post_summary(kind, now)
+
+
+# ---------- Failed Break trade log as CSV, for the Google Sheets tracker (=IMPORTDATA) ----------
+@app.get("/scanner/trades.csv")
+async def scanner_trades_csv():
+    """Every Failed Break trade that was entered: open ones and closed ones. Read-only, no key needed
+    (these trades are already posted in the Telegram group)."""
+    import csv
+    import io
+    from fastapi.responses import PlainTextResponse
+    dash_id = SCANNERS[SUMMARY_SCANNER][0]
+    async with httpx.AsyncClient(timeout=30) as client:
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers=SB_HEADERS,
+                                 params=[("scanner", f"eq.{dash_id}"), ("status", "in.(triggered,tp,sl,be)"),
+                                         ("select", "created_at,updated_at,symbol,tf,side,entry,sl,tp,rf,rf_hit,status"),
+                                         ("order", "created_at.asc")])).json()
+    if not isinstance(rows, list):
+        rows = []
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Date", "Time (UK)", "Pair", "Timeframe", "Direction", "Entry", "SL", "TP",
+                "Risk free hit", "Result", "R"])
+    names = {"tp": "Win", "sl": "Loss", "be": "Breakeven", "triggered": "Open"}
+    for x in rows:
+        t = datetime.fromisoformat(x["created_at"].replace("Z", "+00:00")).astimezone(UK)
+        pair = _pair({"symbol": x.get("symbol")}) or str(x.get("symbol") or "")
+        r = "" if x["status"] == "triggered" else round(_trade_r(x), 2)
+        w.writerow([t.strftime("%Y-%m-%d"), t.strftime("%H:%M"), pair, x.get("tf") or "",
+                    "Buy" if x.get("side") == "buy" else "Sell", x["entry"], x["sl"], x["tp"],
+                    "Yes" if x.get("rf_hit") else "No", names.get(x["status"], x["status"]), r])
+    return PlainTextResponse(out.getvalue(), media_type="text/csv")
