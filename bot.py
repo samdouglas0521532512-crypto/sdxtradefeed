@@ -663,8 +663,31 @@ def _r(x: float) -> str:
     return f"{x:.1f}".rstrip("0").rstrip(".")
 
 
+def _fmtc(x: float, pip: float) -> str:
+    tick = pip / 10 if pip else 0.00001
+    dec = max(0, round(-math.log10(tick))) if tick < 1 else 0
+    return f"{x:,.{dec}f}"
+
+
+def _pips(x: float) -> str:
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+FB_RISK = os.environ.get("FB_RISK", "1.5%")
+
+
 def scanner_text(ev: str, d: dict, name: str) -> str:
     pip = float(d.get("pip") or 0) or 0.0001
+    if name == "SDX Failed Break" and ev == "new":
+        e, sl, tp = (float(d[k]) for k in ("entry", "sl", "tp"))
+        order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
+        return (f"{d['symbol']} {d['side'].upper()} {order} \n\n@{_fmtc(e, pip)} \n\n"
+                f"SL {_fmtc(sl, pip)} ( {_pips(abs(e - sl) / pip)} pips ) \n\n"
+                f"TP {_fmtc(tp, pip)} ( {_pips(abs(tp - e) / pip)} pips )\n\n"
+                f"Risk ={FB_RISK}\n\n"
+                f"Risk free point @{_fmtc(float(d['rf']), pip)}")
+    if name == "SDX Failed Break" and ev == "rf":
+        return "Risk free point hit ✅"
     e, sl, tp, rf = (float(d[k]) for k in ("entry", "sl", "tp", "rf"))
     side = d["side"].upper()
     multi = all(k in d for k in ("tp1", "tp2", "tp3"))
