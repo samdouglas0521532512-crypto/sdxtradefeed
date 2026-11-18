@@ -717,6 +717,17 @@ def _pips(x: float) -> str:
 FB_RISK = os.environ.get("FB_RISK", "1.5%")
 
 
+def _fb_pip(d: dict) -> float:
+    """Pip size for a Failed Break pair: what the alert sends, else gold 0.1, GER30 1 point, FX 0.0001."""
+    try:
+        p = float(d.get("pip") or 0)
+    except Exception:
+        p = 0
+    if p:
+        return p
+    return {"XAUUSD": 0.1, "GER30": 1.0}.get(_pair(d), 0.0001)
+
+
 def scanner_text(ev: str, d: dict, name: str) -> str:
     pip = float(d.get("pip") or 0) or 0.0001
     if name == "SDX Failed Break" and ev == "new":
@@ -739,12 +750,18 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
         return "No entry ❌\n\nThe setup didn't confirm, no trade"
     if name == "SDX Failed Break" and ev == "rf":
         return "Risk free point hit ✅\n\nGo risk free"
-    if name == "SDX Failed Break" and ev == "tp" and d.get("month_r") is not None:
+    if name == "SDX Failed Break" and ev in ("tp", "sl"):
         e, sl, tp = (float(d[k]) for k in ("entry", "sl", "tp"))
+        fp = _fb_pip(d)
+        if ev == "sl":
+            return f"SL HIT -1R ( -{_pips(abs(e - sl) / fp)} pips ) ❌"
+        head = (f"Take Profit Hit ✅\n\n+{_r(abs(tp - e) / abs(e - sl))}R ( +{_pips(abs(tp - e) / fp)} pips ) "
+                f"Secured on this position")
+        if d.get("month_r") is None:
+            return head
         m = float(d["month_r"])
         state = f"now in profit off {_r(m)}R" if m > 0 else ("now flat" if m == 0 else f"now down {_r(abs(m))}R")
-        return (f"Take Profit Hit ✅\n\n+{_r(abs(tp - e) / abs(e - sl))}R Secured on this position , "
-                f"{state} on the month due to risking {FB_RISK}")
+        return f"{head} , {state} on the month due to risking {FB_RISK}"
     e, sl, tp, rf = (float(d[k]) for k in ("entry", "sl", "tp", "rf"))
     side = d["side"].upper()
     multi = all(k in d for k in ("tp1", "tp2", "tp3"))
