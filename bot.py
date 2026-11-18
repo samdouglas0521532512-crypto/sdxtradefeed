@@ -762,6 +762,48 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
     return ""
 
 
+@app.get("/scanner/demo")
+async def scanner_demo(key: str = "", symbol: str = "XAUUSD", price: float = 4123.45, side: str = "sell", result: str = "tp"):
+    """Open this link in a browser to post an example trade (get ready, entry, risk free, result) in the Failed Break channel."""
+    if not SCANNER_KEY or key != SCANNER_KEY:
+        raise HTTPException(status_code=403)
+    t = asyncio.create_task(_demo(symbol, price, side, result))
+    _TASKS.add(t)
+    t.add_done_callback(_TASKS.discard)
+    return {"ok": True, "note": "Example trade is posting now, one message every few seconds."}
+
+
+async def _demo(symbol: str, price: float, side: str, result: str):
+    name = "SDX Failed Break"
+    d = 1 if side == "buy" else -1
+    pip = 0.1 if price > 100 else 0.0001
+    risk = 47 * pip
+    e = price
+    base = {"symbol": symbol, "tf": "15", "side": "buy" if d == 1 else "sell", "pip": str(pip), "order": "now",
+            "entry": str(e), "sl": str(e - d * risk), "tp": str(e + d * 4 * risk), "rf": str(e + d * 1.5 * risk)}
+    ready = {**base, "entry": str(e - d * 0.8 * risk), "sl": str(e - d * 0.95 * risk)}
+    steps = [("ready", ready), ("new", base), ("rf", base)]
+    steps.append(("tp", {**base, "month_r": 4.0}) if result == "tp" else ("be", {**base, "r": "0"}) if result == "be" else ("sl", base))
+    chat = SCANNER_CHATS.get(name) or SCANNER_CHAT_ID
+    topic = SCANNERS[name][1]
+    prev = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        for ev, data in steps:
+            if result == "sl" and ev == "rf":
+                continue
+            msg = {"chat_id": chat, "text": "EXAMPLE - NOT A LIVE TRADE\n\n" + scanner_text(ev, data, name)}
+            if topic:
+                msg["message_thread_id"] = topic
+            if prev:
+                msg["reply_parameters"] = {"message_id": prev, "allow_sending_without_reply": True}
+            try:
+                sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
+                prev = (sent.get("result") or {}).get("message_id") or prev
+            except Exception as exc:
+                print("demo failed:", repr(exc), flush=True)
+            await asyncio.sleep(4)
+
+
 _SEEN = {}
 _TASKS = set()
 _READY = {}
