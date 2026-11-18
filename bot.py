@@ -638,6 +638,7 @@ SCANNERS = {
     "SDX Phantom": ("obsidian", 6),
     "SDX Raid": ("cobalt", 4),
     "SDX Ghost": ("iridium", 2),
+    "SDX Failed Break": ("trap", int(os.environ.get("FB_TOPIC", "0") or 0)),
 }
 
 
@@ -694,7 +695,7 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
         return "TP2 hit ✅\n\nClose another 1/3, let the rest run to TP3"
     if ev == "tp3":
         return f"TP3 hit ✅\n\nAll targets hit, +{_r(float(d.get('r') or 0))}R Secured on this position"
-    if ev == "be" and d.get("r") is not None:
+    if ev == "be" and d.get("r") is not None and float(d.get("r") or 0) > 0:
         return f"Rest of the position closed at entry ✅\n\n+{_r(float(d['r']))}R Secured on this position"
     if ev == "new":
         order = "NOW" if d.get("order", "now") == "now" else "LIMIT"
@@ -712,6 +713,9 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
         return "SL HIT -1R ❌"
     if ev == "cancel":
         return "Setup cancelled - remove the limit order"
+    if ev == "close":
+        r = float(d.get("r") or 0)
+        return f"Trade closed at market (time limit) {'+' if r > 0 else ''}{_r(r)}R"
     return ""
 
 
@@ -725,7 +729,7 @@ async def scanner(request: Request):
     if not SCANNER_KEY or d.get("key") != SCANNER_KEY:
         raise HTTPException(status_code=403)
     name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
-    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3") or not sid:
+    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close") or not sid:
         raise HTTPException(status_code=400, detail="bad_signal")
     dash_id, topic = SCANNERS[name]
     hdr = {**SB_HEADERS, "Content-Type": "application/json"}
@@ -738,7 +742,9 @@ async def scanner(request: Request):
         if ev == "new" and row:
             return {"ok": True, "note": "duplicate"}
 
-        msg = {"chat_id": SCANNER_CHAT_ID, "message_thread_id": topic, "text": scanner_text(ev, d, name)}
+        msg = {"chat_id": SCANNER_CHAT_ID, "text": scanner_text(ev, d, name)}
+        if topic:
+            msg["message_thread_id"] = topic
         if row and row.get("tg_msg"):
             msg["reply_parameters"] = {"message_id": row["tg_msg"], "allow_sending_without_reply": True}
         tg_msg = None
@@ -759,7 +765,9 @@ async def scanner(request: Request):
             elif ev == "tp2" and not ("tp1" in d and "tp2" in d and "tp3" not in d):
                 pass
             else:
-                patch["status"] = {"tp": "tp", "tp2": "tp", "tp3": "tp", "sl": "sl", "be": "be", "cancel": "cancelled"}[ev]
+                r = float(d.get("r") or 0)
+                close_st = "tp" if r > 0 else "sl" if r < 0 else "be"
+                patch["status"] = {"tp": "tp", "tp2": "tp", "tp3": "tp", "sl": "sl", "be": "be", "cancel": "cancelled", "close": close_st}[ev]
             await client.patch(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
                                params={"setup_id": f"eq.{sid}"}, json=patch)
     return {"ok": True}
