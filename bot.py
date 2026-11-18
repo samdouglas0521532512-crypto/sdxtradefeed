@@ -629,6 +629,8 @@ SCANNER_BOT_TOKEN = os.environ.get("SCANNER_BOT_TOKEN", "")
 SCANNER_KEY = os.environ.get("SCANNER_KEY", "")
 SCANNER_CHAT_ID = os.environ.get("SCANNER_CHAT_ID", "-1004453278644")
 SCANNER_TG = f"https://api.telegram.org/bot{SCANNER_BOT_TOKEN}"
+# a scanner can post to its own group instead of the main scanners group
+SCANNER_CHATS = {"SDX Failed Break": os.environ.get("FB_CHAT_ID", "")}
 
 # scanner name -> (dashboard id, Telegram topic)
 SCANNERS = {
@@ -735,7 +737,7 @@ async def scanner(request: Request):
     if ev == "test":
         if not SCANNER_BOT_TOKEN:
             return {"ok": False, "note": "SCANNER_BOT_TOKEN is not set on the server"}
-        msg = {"chat_id": SCANNER_CHAT_ID, "text": f"{name} is connected ✅\n\n{d.get('symbol', '')} {_tf(d.get('tf', ''))} - trades will post here."}
+        msg = {"chat_id": SCANNER_CHATS.get(name) or SCANNER_CHAT_ID, "text": f"{name} is connected ✅\n\n{d.get('symbol', '')} {_tf(d.get('tf', ''))} - trades will post here."}
         if topic:
             msg["message_thread_id"] = topic
         async with httpx.AsyncClient(timeout=30) as client:
@@ -751,7 +753,7 @@ async def scanner(request: Request):
         if ev == "new" and row:
             return {"ok": True, "note": "duplicate"}
 
-        msg = {"chat_id": SCANNER_CHAT_ID, "text": scanner_text(ev, d, name)}
+        msg = {"chat_id": SCANNER_CHATS.get(name) or SCANNER_CHAT_ID, "text": scanner_text(ev, d, name)}
         if topic:
             msg["message_thread_id"] = topic
         if row and row.get("tg_msg"):
