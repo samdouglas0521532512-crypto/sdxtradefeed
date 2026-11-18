@@ -684,8 +684,7 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
         return (f"{d['symbol']} {d['side'].upper()} {order} \n\n@{_fmtc(e, pip)} \n\n"
                 f"SL {_fmtc(sl, pip)} ( {_pips(abs(e - sl) / pip)} pips ) \n\n"
                 f"TP {_fmtc(tp, pip)} ( {_pips(abs(tp - e) / pip)} pips )\n\n"
-                f"Risk ={FB_RISK}\n\n"
-                f"Risk free point @{_fmtc(float(d['rf']), pip)}")
+                f"Risk ={FB_RISK}")
     if name == "SDX Failed Break" and ev == "ready":
         lvl, ext = float(d["entry"]), float(d["sl"])
         buy = d["side"] == "buy"
@@ -698,7 +697,7 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
     if name == "SDX Failed Break" and ev == "cancel":
         return "No entry ❌\n\nThe setup didn't confirm, no trade"
     if name == "SDX Failed Break" and ev == "rf":
-        return "Risk free point hit ✅"
+        return "Risk free point hit ✅\n\nGo risk free"
     if name == "SDX Failed Break" and ev == "tp" and d.get("month_r") is not None:
         e, sl, tp = (float(d[k]) for k in ("entry", "sl", "tp"))
         m = float(d["month_r"])
@@ -782,7 +781,16 @@ async def _demo(symbol: str, price: float, side: str, result: str):
     base = {"symbol": symbol, "tf": "15", "side": "buy" if d == 1 else "sell", "pip": str(pip), "order": "now",
             "entry": str(e), "sl": str(e - d * risk), "tp": str(e + d * 4 * risk), "rf": str(e + d * 1.5 * risk)}
     ready = {**base, "entry": str(e - d * 0.8 * risk), "sl": str(e - d * 0.95 * risk)}
-    steps = [("ready", ready), ("new", base), ("rf", base)]
+    try:
+        import chart
+        cs, swing, sl_tip = chart.demo_candles(e, base["side"], pip)
+        risk = abs(e - sl_tip)
+        base = {**base, "sl": str(sl_tip), "tp": str(e + d * 4 * risk), "rf": str(e + d * 1.5 * risk),
+                "candles": cs, "lvl": str(swing), "t0": str(int((datetime.now(timezone.utc).timestamp() - 60 * 15 * 60) * 1000))}
+        ready = {**ready, "entry": str(swing), "sl": str(sl_tip)}
+    except Exception as exc:
+        print("demo chart failed:", repr(exc), flush=True)
+    steps = [("ready", ready), ("new", base), ("rfat", base), ("rf", base)]
     steps.append(("tp", {**base, "month_r": 4.0}) if result == "tp" else ("be", {**base, "r": "0"}) if result == "be" else ("sl", base))
     chat = SCANNER_CHATS.get(name) or SCANNER_CHAT_ID
     topic = SCANNERS[name][1]
@@ -791,17 +799,48 @@ async def _demo(symbol: str, price: float, side: str, result: str):
         for ev, data in steps:
             if result == "sl" and ev == "rf":
                 continue
-            msg = {"chat_id": chat, "text": "EXAMPLE - NOT A LIVE TRADE\n\n" + scanner_text(ev, data, name)}
+            if ev == "rfat" and False:
+                continue
+            text = f"Risk free point @{_fmtc(float(data['rf']), pip)}" if ev == "rfat" else scanner_text(ev, data, name)
+            msg = {"chat_id": chat, "text": "EXAMPLE - NOT A LIVE TRADE\n\n" + text}
             if topic:
                 msg["message_thread_id"] = topic
             if prev:
                 msg["reply_parameters"] = {"message_id": prev, "allow_sending_without_reply": True}
             try:
-                sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
-                prev = (sent.get("result") or {}).get("message_id") or prev
+                mid = await _tg_send(client, msg, _chart(data) if ev == "new" else None)
+                if ev in ("ready", "new"):
+                    prev = mid or prev
             except Exception as exc:
                 print("demo failed:", repr(exc), flush=True)
             await asyncio.sleep(4)
+
+
+async def _tg_send(client, msg: dict, photo: bytes = None):
+    """Send a text message, or a photo with the text as its caption. Returns the message id."""
+    if photo:
+        data = {"chat_id": str(msg["chat_id"]), "caption": msg["text"]}
+        if msg.get("message_thread_id"):
+            data["message_thread_id"] = str(msg["message_thread_id"])
+        if msg.get("reply_parameters"):
+            data["reply_parameters"] = json.dumps(msg["reply_parameters"])
+        sent = (await client.post(f"{SCANNER_TG}/sendPhoto", data=data, files={"photo": ("chart.png", photo, "image/png")})).json()
+        if sent.get("ok"):
+            return sent["result"]["message_id"]
+        print("photo failed, sending text:", sent.get("description"), flush=True)
+    sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
+    return (sent.get("result") or {}).get("message_id")
+
+
+def _chart(d: dict):
+    if not d.get("candles"):
+        return None
+    try:
+        import chart
+        return chart.draw(d)
+    except Exception as exc:
+        print("chart failed:", repr(exc), flush=True)
+        return None
 
 
 _SEEN = {}
@@ -906,8 +945,15 @@ async def _scanner_post(d: dict, name: str, ev: str, sid: str):
             msg["reply_parameters"] = {"message_id": _READY[sid], "allow_sending_without_reply": True}
         tg_msg = None
         if SCANNER_BOT_TOKEN:
-            sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
-            tg_msg = (sent.get("result") or {}).get("message_id")
+            fb_new = name == "SDX Failed Break" and ev == "new"
+            tg_msg = await _tg_send(client, msg, _chart(d) if fb_new else None)
+            if fb_new:
+                rf_msg = {"chat_id": msg["chat_id"], "text": f"Risk free point @{_fmtc(float(d['rf']), float(d.get('pip') or 0.0001))}"}
+                if topic:
+                    rf_msg["message_thread_id"] = topic
+                if tg_msg:
+                    rf_msg["reply_parameters"] = {"message_id": tg_msg, "allow_sending_without_reply": True}
+                await _tg_send(client, rf_msg)
 
         if ev == "new":
             await client.post(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
