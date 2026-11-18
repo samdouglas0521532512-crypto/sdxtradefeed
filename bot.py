@@ -974,3 +974,150 @@ async def _scanner_post(d: dict, name: str, ev: str, sid: str):
             await client.patch(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers={**hdr, "Prefer": "return=minimal"},
                                params={"setup_id": f"eq.{sid}"}, json=patch)
     return {"ok": True}
+
+
+# ---------- daily / weekly / monthly results for the Failed Break channel ----------
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+
+UK = ZoneInfo("Europe/London")
+SUMMARY_SCANNER = "SDX Failed Break"
+SUMMARY_TIME = os.environ.get("SUMMARY_TIME", "21:00")  # UK time, weekdays
+_POSTED = set()
+
+
+def _risk_pct() -> float:
+    try:
+        return float(FB_RISK.strip().rstrip("%"))
+    except Exception:
+        return 0.0
+
+
+def _trade_r(x: dict) -> float:
+    if x["status"] == "sl":
+        return -1.0
+    if x["status"] == "tp":
+        return abs(float(x["tp"]) - float(x["entry"])) / abs(float(x["entry"]) - float(x["sl"]))
+    return 0.0
+
+
+def _rtxt(r: float) -> str:
+    return "0R" if round(r, 1) == 0 else f"{'+' if r > 0 else '-'}{_r(abs(r))}R"
+
+
+def _ptxt(r: float) -> str:
+    p = r * _risk_pct()
+    return "0%" if round(p, 2) == 0 else f"{'+' if p > 0 else '-'}{_r(abs(p))}%"
+
+
+def _period(kind: str, now: datetime):
+    """Start and end (UK time) of the day, week or month that `now` is in."""
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if kind == "day":
+        return day, day + timedelta(days=1)
+    if kind == "week":
+        start = day - timedelta(days=day.weekday())
+        return start, start + timedelta(days=7)
+    start = day.replace(day=1)
+    return start, (start + timedelta(days=32)).replace(day=1)
+
+
+async def _closed_trades(client, start: datetime, end: datetime) -> list:
+    dash_id = SCANNERS[SUMMARY_SCANNER][0]
+    rows = (await client.get(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers=SB_HEADERS,
+                             params=[("scanner", f"eq.{dash_id}"), ("status", "in.(tp,sl,be)"),
+                                     ("updated_at", f"gte.{start.astimezone(timezone.utc).isoformat()}"),
+                                     ("updated_at", f"lt.{end.astimezone(timezone.utc).isoformat()}"),
+                                     ("select", "entry,sl,tp,status,updated_at"), ("order", "updated_at.asc")])).json()
+    return rows if isinstance(rows, list) else []
+
+
+def summary_text(kind: str, now: datetime, rows: list) -> str:
+    start, _ = _period(kind, now)
+    title = {"day": f"DAILY RESULTS - {now:%a %-d %b}",
+             "week": f"WEEKLY RESULTS - w/c {start:%-d %b}",
+             "month": f"MONTHLY RESULTS - {now:%B %Y}"}[kind]
+    if not rows:
+        return f"{title}\n\nNo trades closed. No setups met the rules, so no trades were forced."
+    wins = sum(1 for x in rows if x["status"] == "tp")
+    losses = sum(1 for x in rows if x["status"] == "sl")
+    bes = sum(1 for x in rows if x["status"] == "be")
+    total = sum(_trade_r(x) for x in rows)
+    wr = f"{round(100 * wins / (wins + losses))}%" if wins + losses else "-"
+    out = (f"{title}\n\nTrades: {len(rows)}\nWins: {wins} | Losses: {losses} | Breakeven: {bes}\n"
+           f"Win rate: {wr}\n\n{_rtxt(total)} ( {_ptxt(total)} )")
+    if kind in ("week", "month"):
+        groups = {}
+        for x in rows:
+            t = datetime.fromisoformat(x["updated_at"].replace("Z", "+00:00")).astimezone(UK)
+            key = f"{t:%a}" if kind == "week" else f"w/c {(t - timedelta(days=t.weekday())):%-d %b}"
+            groups[key] = groups.get(key, 0.0) + _trade_r(x)
+        out += "\n\n" + "\n".join(f"{k}: {_rtxt(v)}" for k, v in groups.items())
+    return out
+
+
+async def post_summary(kind: str, now: datetime = None) -> dict:
+    now = now or datetime.now(UK)
+    start, end = _period(kind, now)
+    async with httpx.AsyncClient(timeout=30) as client:
+        rows = await _closed_trades(client, start, end)
+        msg = {"chat_id": SCANNER_CHATS.get(SUMMARY_SCANNER) or SCANNER_CHAT_ID, "text": summary_text(kind, now, rows)}
+        topic = SCANNERS[SUMMARY_SCANNER][1]
+        if topic:
+            msg["message_thread_id"] = topic
+        await _tg_send(client, msg)
+    return {"ok": True, "text": msg["text"]}
+
+
+def _due(now: datetime) -> list:
+    """Which summaries are due right now: daily every weekday, weekly on Friday, monthly on the last weekday of the month."""
+    if now.weekday() >= 5 or now.strftime("%H:%M") < SUMMARY_TIME:
+        return []
+    due = ["day"]
+    if now.weekday() == 4:
+        due.append("week")
+    nxt = now + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    if nxt.month != now.month:
+        due.append("month")
+    return due
+
+
+async def _summary_loop():
+    while True:
+        try:
+            now = datetime.now(UK)
+            for kind in _due(now):
+                key = (kind, now.date())
+                if key not in _POSTED:
+                    _POSTED.add(key)
+                    await post_summary(kind, now)
+                    await asyncio.sleep(3)
+        except Exception as exc:
+            print("summary failed:", repr(exc), flush=True)
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _start_summaries():
+    if SCANNER_BOT_TOKEN:
+        t = asyncio.create_task(_summary_loop())
+        _TASKS.add(t)
+
+
+@app.get("/scanner/summary")
+async def scanner_summary(key: str = "", kind: str = "day", preview: int = 0):
+    """Post (or with preview=1, just show) the daily / weekly / monthly results now."""
+    if not SCANNER_KEY or key != SCANNER_KEY:
+        raise HTTPException(status_code=403)
+    if kind not in ("day", "week", "month"):
+        raise HTTPException(status_code=400, detail="kind must be day, week or month")
+    now = datetime.now(UK)
+    if preview:
+        start, end = _period(kind, now)
+        async with httpx.AsyncClient(timeout=30) as client:
+            rows = await _closed_trades(client, start, end)
+        return {"ok": True, "text": summary_text(kind, now, rows)}
+    _POSTED.add((kind, now.date()))  # so the automatic one doesn't post it again tonight
+    return await post_summary(kind, now)
