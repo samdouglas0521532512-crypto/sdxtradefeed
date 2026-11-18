@@ -926,7 +926,7 @@ async def scanner(request: Request):
         raise HTTPException(status_code=403)
     name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
     # same alert arriving twice (two copies of the alert, or TradingView retrying): only post it once
-    _k = (name, ev, sid, d.get("tf"))
+    _k = (name, ev, sid, d.get("tf"), str(d.get("symbol") or "").upper())
     _now = time.time()
     for _o in [k for k, t in _SEEN.items() if _now - t > 600]:
         _SEEN.pop(_o, None)
