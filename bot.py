@@ -887,6 +887,12 @@ async def _tg_send(client, msg: dict, photo: bytes = None):
             return sent["result"]["message_id"]
         print("photo failed, sending text:", sent.get("description"), flush=True)
     sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
+    if not sent.get("ok") and msg.get("reply_parameters"):
+        # Telegram refused it (for example the trade message it replies to is gone): send it on its own instead
+        print("telegram refused reply, sending plain:", sent.get("description"), flush=True)
+        sent = (await client.post(f"{SCANNER_TG}/sendMessage", json={k: v for k, v in msg.items() if k != "reply_parameters"})).json()
+    if not sent.get("ok"):
+        print("telegram send failed:", sent.get("description"), msg.get("text", "")[:60], flush=True)
     return (sent.get("result") or {}).get("message_id")
 
 
@@ -942,6 +948,7 @@ async def scanner(request: Request):
     if not SCANNER_KEY or d.get("key") != SCANNER_KEY:
         raise HTTPException(status_code=403)
     name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
+    print("scanner alert in:", name, ev, d.get("symbol"), d.get("tf"), sid, flush=True)
     # same alert arriving twice (two copies of the alert, or TradingView retrying): only post it once
     _k = (name, ev, sid, d.get("tf"), str(d.get("symbol") or "").upper())
     _now = time.time()
