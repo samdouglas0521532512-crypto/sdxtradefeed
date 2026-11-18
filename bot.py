@@ -1219,3 +1219,10 @@ async def scanner_trades_csv():
                     "Buy" if x.get("side") == "buy" else "Sell", x["entry"], x["sl"], x["tp"],
                     "Yes" if x.get("rf_hit") else "No", names.get(x["status"], x["status"]), r])
     return PlainTextResponse(out.getvalue(), media_type="text/csv")
+
+
+@app.get("/scanner/backtest.csv")
+async def scanner_backtest_csv():
+    """Failed Break Mech Model backtest trades (same trades as the dashboard's Mech groups), for the Google Sheets tracker."""
+    from fastapi.responses import FileResponse
+    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest.csv"), media_type="text/csv")
