@@ -721,6 +721,9 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
     return ""
 
 
+_SEEN = {}
+
+
 @app.post("/scanner")
 async def scanner(request: Request):
     raw = await request.body()
@@ -731,6 +734,14 @@ async def scanner(request: Request):
     if not SCANNER_KEY or d.get("key") != SCANNER_KEY:
         raise HTTPException(status_code=403)
     name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
+    # same alert arriving twice (two copies of the alert, or TradingView retrying): only post it once
+    _k = (name, ev, sid, d.get("tf"))
+    _now = time.time()
+    for _o in [k for k, t in _SEEN.items() if _now - t > 600]:
+        _SEEN.pop(_o, None)
+    if _k in _SEEN:
+        return {"ok": True, "note": "duplicate"}
+    _SEEN[_k] = _now
     if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close", "test") or not sid:
         raise HTTPException(status_code=400, detail="bad_signal")
     dash_id, topic = SCANNERS[name]
