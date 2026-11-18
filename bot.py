@@ -686,6 +686,17 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
                 f"TP {_fmtc(tp, pip)} ( {_pips(abs(tp - e) / pip)} pips )\n\n"
                 f"Risk ={FB_RISK}\n\n"
                 f"Risk free point @{_fmtc(float(d['rf']), pip)}")
+    if name == "SDX Failed Break" and ev == "ready":
+        lvl, ext = float(d["entry"]), float(d["sl"])
+        buy = d["side"] == "buy"
+        tfn = _tf(d["tf"])
+        return (f"{d['symbol']} {'BUY' if buy else 'SELL'} SETUP FORMING ( {tfn} )\n\n"
+                f"Failed break of {_fmtc(lvl, pip)} ✅\n\n"
+                f"If the next {tfn} candle closes {'bullish' if buy else 'bearish'}, {'buy' if buy else 'sell'} at the close\n\n"
+                f"SL will be just {'below' if buy else 'above'} {_fmtc(ext, pip)}\n\n"
+                f"Get ready")
+    if name == "SDX Failed Break" and ev == "cancel":
+        return "No entry ❌\n\nThe setup didn't confirm, no trade"
     if name == "SDX Failed Break" and ev == "rf":
         return "Risk free point hit ✅"
     if name == "SDX Failed Break" and ev == "tp" and d.get("month_r") is not None:
@@ -753,6 +764,7 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
 
 _SEEN = {}
 _TASKS = set()
+_READY = {}
 _SCAN_LOCK = asyncio.Lock()
 
 
@@ -774,7 +786,7 @@ async def scanner(request: Request):
     if _k in _SEEN:
         return {"ok": True, "note": "duplicate"}
     _SEEN[_k] = _now
-    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close", "test") or not sid:
+    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close", "test", "ready") or not sid:
         raise HTTPException(status_code=400, detail="bad_signal")
     # answer TradingView straight away (it gives up after a few seconds), then post in the background, in order
     _t = asyncio.create_task(_scanner_work(d, name, ev, sid))
@@ -802,6 +814,19 @@ async def _scanner_post(d: dict, name: str, ev: str, sid: str):
         async with httpx.AsyncClient(timeout=30) as client:
             sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
         return {"ok": bool(sent.get("ok")), "telegram": sent.get("description", "")}
+    if name == "SDX Failed Break" and ev in ("ready", "cancel"):
+        msg = {"chat_id": SCANNER_CHATS.get(name) or SCANNER_CHAT_ID, "text": scanner_text(ev, d, name)}
+        if topic:
+            msg["message_thread_id"] = topic
+        if ev == "cancel" and _READY.get(sid):
+            msg["reply_parameters"] = {"message_id": _READY[sid], "allow_sending_without_reply": True}
+        async with httpx.AsyncClient(timeout=30) as client:
+            sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
+        if ev == "ready":
+            _READY[sid] = (sent.get("result") or {}).get("message_id")
+            if len(_READY) > 200:
+                _READY.pop(next(iter(_READY)))
+        return
     hdr = {**SB_HEADERS, "Content-Type": "application/json"}
     now = datetime.now(timezone.utc).isoformat()
 
@@ -835,6 +860,8 @@ async def _scanner_post(d: dict, name: str, ev: str, sid: str):
             msg["message_thread_id"] = topic
         if row and row.get("tg_msg"):
             msg["reply_parameters"] = {"message_id": row["tg_msg"], "allow_sending_without_reply": True}
+        elif ev == "new" and _READY.get(sid):
+            msg["reply_parameters"] = {"message_id": _READY[sid], "allow_sending_without_reply": True}
         tg_msg = None
         if SCANNER_BOT_TOKEN:
             sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
