@@ -729,9 +729,18 @@ async def scanner(request: Request):
     if not SCANNER_KEY or d.get("key") != SCANNER_KEY:
         raise HTTPException(status_code=403)
     name, ev, sid = d.get("scanner"), d.get("event"), d.get("id")
-    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close") or not sid:
+    if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close", "test") or not sid:
         raise HTTPException(status_code=400, detail="bad_signal")
     dash_id, topic = SCANNERS[name]
+    if ev == "test":
+        if not SCANNER_BOT_TOKEN:
+            return {"ok": False, "note": "SCANNER_BOT_TOKEN is not set on the server"}
+        msg = {"chat_id": SCANNER_CHAT_ID, "text": f"{name} is connected ✅\n\n{d.get('symbol', '')} {_tf(d.get('tf', ''))} - trades will post here."}
+        if topic:
+            msg["message_thread_id"] = topic
+        async with httpx.AsyncClient(timeout=30) as client:
+            sent = (await client.post(f"{SCANNER_TG}/sendMessage", json=msg)).json()
+        return {"ok": bool(sent.get("ok")), "telegram": sent.get("description", "")}
     hdr = {**SB_HEADERS, "Content-Type": "application/json"}
     now = datetime.now(timezone.utc).isoformat()
 
