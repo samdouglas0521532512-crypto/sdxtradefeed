@@ -688,6 +688,12 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
                 f"Risk free point @{_fmtc(float(d['rf']), pip)}")
     if name == "SDX Failed Break" and ev == "rf":
         return "Risk free point hit ✅"
+    if name == "SDX Failed Break" and ev == "tp" and d.get("month_r") is not None:
+        e, sl, tp = (float(d[k]) for k in ("entry", "sl", "tp"))
+        m = float(d["month_r"])
+        state = f"now in profit off {_r(m)}R" if m > 0 else ("now flat" if m == 0 else f"now down {_r(abs(m))}R")
+        return (f"Take Profit Hit ✅\n\n+{_r(abs(tp - e) / abs(e - sl))}R Secured on this position , "
+                f"{state} on the month due to risking {FB_RISK}")
     e, sl, tp, rf = (float(d[k]) for k in ("entry", "sl", "tp", "rf"))
     side = d["side"].upper()
     multi = all(k in d for k in ("tp1", "tp2", "tp3"))
@@ -806,6 +812,24 @@ async def _scanner_post(d: dict, name: str, ev: str, sid: str):
         if ev == "new" and row:
             return {"ok": True, "note": "duplicate"}
 
+        if name == "SDX Failed Break" and ev == "tp":
+            try:
+                start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+                done = (await client.get(f"{SUPABASE_URL}/rest/v1/scanner_signals", headers=SB_HEADERS,
+                                         params={"scanner": f"eq.{dash_id}", "created_at": f"gte.{start}",
+                                                 "status": "in.(tp,sl,be)", "select": "entry,sl,tp,status,setup_id"})).json()
+                mr = 0.0
+                for x in done:
+                    if x.get("setup_id") == sid:
+                        continue
+                    if x["status"] == "tp":
+                        mr += abs(float(x["tp"]) - float(x["entry"])) / abs(float(x["entry"]) - float(x["sl"]))
+                    elif x["status"] == "sl":
+                        mr -= 1
+                mr += abs(float(d["tp"]) - float(d["entry"])) / abs(float(d["entry"]) - float(d["sl"]))
+                d = {**d, "month_r": round(mr, 1)}
+            except Exception as exc:
+                print("month R failed:", repr(exc), flush=True)
         msg = {"chat_id": SCANNER_CHATS.get(name) or SCANNER_CHAT_ID, "text": scanner_text(ev, d, name)}
         if topic:
             msg["message_thread_id"] = topic
