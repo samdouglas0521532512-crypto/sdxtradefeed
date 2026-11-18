@@ -5,6 +5,7 @@ Telegram sends every post (and every edit) from the SDX Trade Ideas channel
 to this little web app. It saves the message, and any chart image, into
 Supabase. The SDX dashboard reads from the same table and shows it live.
 """
+import asyncio
 import html
 import json
 import math
@@ -722,6 +723,8 @@ def scanner_text(ev: str, d: dict, name: str) -> str:
 
 
 _SEEN = {}
+_TASKS = set()
+_SCAN_LOCK = asyncio.Lock()
 
 
 @app.post("/scanner")
@@ -744,6 +747,22 @@ async def scanner(request: Request):
     _SEEN[_k] = _now
     if name not in SCANNERS or ev not in ("new", "rf", "be", "tp", "sl", "cancel", "tp1", "tp2", "tp3", "close", "test") or not sid:
         raise HTTPException(status_code=400, detail="bad_signal")
+    # answer TradingView straight away (it gives up after a few seconds), then post in the background, in order
+    _t = asyncio.create_task(_scanner_work(d, name, ev, sid))
+    _TASKS.add(_t)
+    _t.add_done_callback(_TASKS.discard)
+    return {"ok": True, "queued": True}
+
+
+async def _scanner_work(d: dict, name: str, ev: str, sid: str):
+    async with _SCAN_LOCK:
+        try:
+            await _scanner_post(d, name, ev, sid)
+        except Exception as exc:
+            print("scanner post failed:", name, ev, sid, repr(exc), flush=True)
+
+
+async def _scanner_post(d: dict, name: str, ev: str, sid: str):
     dash_id, topic = SCANNERS[name]
     if ev == "test":
         if not SCANNER_BOT_TOKEN:
