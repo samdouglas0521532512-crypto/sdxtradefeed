@@ -645,8 +645,8 @@ SCANNERS = {
 }
 
 
-# Failed Break: one Telegram topic per pair, set on Render as FB_TOPICS, e.g. XAUUSD=12,EURUSD=34,GER30=56
-FB_PAIRS = ("XAUUSD", "EURUSD", "GER30")
+# Failed Break: one Telegram topic per pair, set on Render as FB_TOPICS, e.g. XAUUSD=12,EURUSD=34,GER30=56,GBPUSD=78
+FB_PAIRS = ("XAUUSD", "EURUSD", "GER30", "GBPUSD")
 
 
 def _fb_topics() -> dict:
@@ -670,6 +670,8 @@ def _pair(d: dict) -> str:
         return "XAUUSD"
     if "EURUSD" in s:
         return "EURUSD"
+    if "GBPUSD" in s:
+        return "GBPUSD"
     if any(k in s for k in ("GER", "DE30", "DE40", "DAX", "GRXEUR")):
         return "GER30"
     return ""
@@ -884,7 +886,7 @@ def _chart(d: dict):
 
 @app.get("/scanner/fb-topics")
 async def scanner_fb_topics(key: str = ""):
-    """Makes one topic per pair (XAUUSD, EURUSD, GER30) in the Failed Break group and says what to put in FB_TOPICS."""
+    """Makes one topic per pair (XAUUSD, EURUSD, GER30, GBPUSD) in the Failed Break group and says what to put in FB_TOPICS."""
     if not SCANNER_KEY or key != SCANNER_KEY:
         raise HTTPException(status_code=403)
     chat = SCANNER_CHATS.get("SDX Failed Break") or SCANNER_CHAT_ID
