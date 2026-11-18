@@ -947,7 +947,7 @@ async def _scanner_post(d: dict, name: str, ev: str, sid: str):
         if SCANNER_BOT_TOKEN:
             fb_new = name == "SDX Failed Break" and ev == "new"
             tg_msg = await _tg_send(client, msg, _chart(d) if fb_new else None)
-            if fb_new:
+            if fb_new and float(d.get("rf") or 0) > 0:
                 rf_msg = {"chat_id": msg["chat_id"], "text": f"Risk free point @{_fmtc(float(d['rf']), float(d.get('pip') or 0.0001))}"}
                 if topic:
                     rf_msg["message_thread_id"] = topic

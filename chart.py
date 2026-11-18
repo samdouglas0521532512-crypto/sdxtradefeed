@@ -43,7 +43,8 @@ def draw(d: dict) -> bytes:
     ax.plot([x0, x1], [e, e], color="#787B86", linewidth=1.4, zorder=4)
     ax.plot([x0, x1], [sl, sl], color=DOWN, linewidth=1.4, zorder=4)
     ax.plot([x0, x1], [tp, tp], color=UP, linewidth=1.4, zorder=4)
-    ax.plot([x0, x1], [rf, rf], color=RF_COL, linewidth=1.2, linestyle=(0, (5, 4)), zorder=4)
+    if rf > 0:
+        ax.plot([x0, x1], [rf, rf], color=RF_COL, linewidth=1.2, linestyle=(0, (5, 4)), zorder=4)
     if lvl is not None:
         ax.plot([max(0, n - 40), x0], [lvl, lvl], color=LVL_COL, linewidth=1.1, linestyle=(0, (2, 3)), zorder=2)
         ax.text(max(0, n - 40) + 0.5, lvl, "Failed break", fontsize=8.5, color=LVL_COL, va="bottom")
@@ -56,6 +57,8 @@ def draw(d: dict) -> bytes:
 
     # price tags on the right, like TradingView
     for y, col, word in ((tp, UP, "TP"), (rf, RF_COL, "Risk free"), (e, "#787B86", "Entry"), (sl, DOWN, "SL")):
+        if y <= 0:
+            continue
         ax.text(x1 + 0.6, y, f" {word}  {_fmt(y, pip)} ", fontsize=8.5, color="white", va="center", ha="left",
                 bbox=dict(boxstyle="square,pad=0.25", facecolor=col, edgecolor="none"), zorder=6)
 
