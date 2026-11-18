@@ -645,6 +645,45 @@ SCANNERS = {
 }
 
 
+# Failed Break: one Telegram topic per pair, set on Render as FB_TOPICS, e.g. XAUUSD=12,EURUSD=34,GER30=56
+FB_PAIRS = ("XAUUSD", "EURUSD", "GER30")
+
+
+def _fb_topics() -> dict:
+    out = {}
+    for part in os.environ.get("FB_TOPICS", "").replace(" ", "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if v.isdigit():
+                out[k.upper()] = int(v)
+    return out
+
+
+def _pair(d: dict) -> str:
+    p = str(d.get("pair") or "").upper()
+    if p == "GOLD":
+        return "XAUUSD"
+    if p in FB_PAIRS:
+        return p
+    s = str(d.get("symbol") or "").upper()
+    if "XAU" in s or "GOLD" in s:
+        return "XAUUSD"
+    if "EURUSD" in s:
+        return "EURUSD"
+    if any(k in s for k in ("GER", "DE30", "DE40", "DAX", "GRXEUR")):
+        return "GER30"
+    return ""
+
+
+def _topic_for(name: str, d: dict) -> int:
+    """Telegram topic for this message: the pair's own topic for the Failed Break, else the scanner's topic."""
+    if name == "SDX Failed Break":
+        t = _fb_topics().get(_pair(d))
+        if t:
+            return t
+    return SCANNERS[name][1]
+
+
 def _tf(tf: str) -> str:
     tf = str(tf)
     if tf.isdigit():
@@ -793,7 +832,7 @@ async def _demo(symbol: str, price: float, side: str, result: str):
     steps = [("ready", ready), ("new", base), ("rfat", base), ("rf", base)]
     steps.append(("tp", {**base, "month_r": 4.0}) if result == "tp" else ("be", {**base, "r": "0"}) if result == "be" else ("sl", base))
     chat = SCANNER_CHATS.get(name) or SCANNER_CHAT_ID
-    topic = SCANNERS[name][1]
+    topic = _topic_for(name, base)
     prev = None
     async with httpx.AsyncClient(timeout=30) as client:
         for ev, data in steps:
@@ -843,6 +882,31 @@ def _chart(d: dict):
         return None
 
 
+@app.get("/scanner/fb-topics")
+async def scanner_fb_topics(key: str = ""):
+    """Makes one topic per pair (XAUUSD, EURUSD, GER30) in the Failed Break group and says what to put in FB_TOPICS."""
+    if not SCANNER_KEY or key != SCANNER_KEY:
+        raise HTTPException(status_code=403)
+    chat = SCANNER_CHATS.get("SDX Failed Break") or SCANNER_CHAT_ID
+    have = _fb_topics()
+    made, errors = {}, {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        for p in FB_PAIRS:
+            if have.get(p):
+                made[p] = have[p]
+                continue
+            r = (await client.post(f"{SCANNER_TG}/createForumTopic", json={"chat_id": chat, "name": p})).json()
+            if r.get("ok"):
+                made[p] = r["result"]["message_thread_id"]
+                await client.post(f"{SCANNER_TG}/sendMessage", json={"chat_id": chat, "message_thread_id": made[p],
+                                                                     "text": f"SDX Failed Break | {p}\n\n{p} trades will post here."})
+            else:
+                errors[p] = r.get("description", "failed")
+    line = ",".join(f"{p}={made[p]}" for p in FB_PAIRS if p in made)
+    return {"ok": not errors, "FB_TOPICS": line, "errors": errors,
+            "next": "On Render, add an environment variable called FB_TOPICS with the value above, then save." if line else ""}
+
+
 _SEEN = {}
 _TASKS = set()
 _READY = {}
@@ -885,7 +949,8 @@ async def _scanner_work(d: dict, name: str, ev: str, sid: str):
 
 
 async def _scanner_post(d: dict, name: str, ev: str, sid: str):
-    dash_id, topic = SCANNERS[name]
+    dash_id = SCANNERS[name][0]
+    topic = _topic_for(name, d)
     if ev == "test":
         if not SCANNER_BOT_TOKEN:
             return {"ok": False, "note": "SCANNER_BOT_TOKEN is not set on the server"}
