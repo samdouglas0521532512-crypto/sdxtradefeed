@@ -360,7 +360,7 @@ async def add_activity(client: httpx.AsyncClient, rows: list, users: list, id_by
         if k == "video":
             if str(it.get("done")).lower() == "true":
                 p["videos"] += 1
-        elif k != "scanreq":
+        elif k not in ("scanreq", "review"):
             p["entries"] += 1
         if k in ("t:live", "t:futures"):
             r = _num(it.get("r"))
@@ -456,6 +456,51 @@ async def admin_scanner_request(request: Request):
             raise HTTPException(status_code=404, detail="not_found")
         data = {**(rows[0].get("data") or {}), "status": status,
                 "handled_at": datetime.now(timezone.utc).isoformat()}
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**SB_HEADERS, "Content-Type": "application/json"},
+                           params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+        return {"ok": True, "data": data}
+
+
+# ---------- Trade reviews: Elite members send a trade, Sam reviews it ----------
+@app.get("/admin/trade-reviews")
+async def admin_trade_reviews(request: Request):
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await current_member(request, client)
+        if me["member"].get("plan") != "Admin":
+            raise HTTPException(status_code=403, detail="admins_only")
+        rows = await sb_all(client, "journal_items", {"select": "id,user_id,data,created_at", "kind": "eq.review",
+                                                      "order": "created_at.desc"})
+        users = (await client.get(f"{SUPABASE_URL}/auth/v1/admin/users", headers=SB_HEADERS,
+                                  params={"per_page": "1000"})).json().get("users", [])
+        email_by_id = {u["id"]: (u.get("email") or "") for u in users}
+        members = (await client.get(f"{SUPABASE_URL}/rest/v1/members", headers=SB_HEADERS,
+                                    params={"select": "email,name,plan"})).json()
+        by_email = {(m.get("email") or "").lower(): m for m in members}
+        out = []
+        for r in rows:
+            em = email_by_id.get(r["user_id"], "")
+            m = by_email.get(em.lower(), {})
+            out.append({"id": r["id"], "created_at": r.get("created_at"), "data": r.get("data") or {},
+                        "email": em, "name": m.get("name") or em, "plan": m.get("plan")})
+        return {"reviews": out}
+
+
+@app.post("/admin/trade-review")
+async def admin_trade_review(request: Request):
+    body = await request.json()
+    reply = str(body.get("reply") or "").strip()
+    if not reply:
+        raise HTTPException(status_code=400, detail="empty_reply")
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await current_member(request, client)
+        if me["member"].get("plan") != "Admin":
+            raise HTTPException(status_code=403, detail="admins_only")
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{body.get('id', '')}", "kind": "eq.review", "select": "id,data"})).json()
+        if not rows:
+            raise HTTPException(status_code=404, detail="not_found")
+        data = {**(rows[0].get("data") or {}), "status": "reviewed", "reply": reply[:6000],
+                "reviewed_at": datetime.now(timezone.utc).isoformat()}
         await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**SB_HEADERS, "Content-Type": "application/json"},
                            params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
         return {"ok": True, "data": data}
@@ -594,6 +639,7 @@ What you help with:
 - The SDX trade service: reading signals, lot sizes, risk, and the member's own results.
 - Trading concepts: market structure, break of structure (BOS), change of character (CHoCH), swing highs and lows, internal and external structure, liquidity, sweeps, inducements (IDM), points of interest (POI), order blocks (OB), breakers, fair value gaps (FVG), inverse fair value gaps (IFVG), balanced price ranges (BPR), premium and discount, and how sessions and news affect price.
 - Explain what each concept is, why it forms, how to spot it on a chart, and how it fits with structure. Give a simple example with made-up prices when it helps.
+- Members can send chart screenshots. When they do, say what you can see: the trend and structure, where the breaks of structure are, the obvious liquidity (highs, lows, equal highs and lows), any fair value gaps, order blocks or balanced price ranges, and whether price is in premium or discount. Point to where on the chart you mean (left, right, top, bottom, the big candle, and so on). If the image is unclear or too zoomed in, say so and ask for a clearer one.
 
 The SDX way of seeing things:
 - Structure comes first. Every concept is read through market structure, never on its own.
@@ -605,7 +651,7 @@ The SDX way of seeing things:
 - Position size is worked out with a lot size calculator (the dashboard's Lot Sizing page, STINU or Myfxbook), never by hand.
 
 Limits:
-- Teach concepts, but do not give trade calls: never tell anyone to buy or sell, where to enter right now, or that a trade will win. This is education, not financial advice.
+- Teach concepts, but do not give trade calls: never tell anyone to buy or sell, where to enter right now, or that a trade will win. This applies to charts they send too: explain what is on the chart, do not tell them to take a trade. This is education, not financial advice.
 - Do not make up the rules of SDX's own entry models. If someone asks for a specific model's exact rules, tell them it is covered in the SDX education and live sessions.
 - Use the member's numbers when they are given.
 - Risk guidance: the trade service recommends about 1% risk per trade and the same risk every time.
@@ -633,7 +679,16 @@ async def coach(request: Request):
                    f"Recent trade service messages (signals and results): {sigs}")
         task = {"review": "Review this member's results: follow rate, profit, consistency, and one thing to improve.",
                 "risk": "Check this member's risk: is it steady and sensible, did they over-risk or skip signals? Give one clear fix."}.get(mode, "")
-        msgs = [m for m in body.get("messages", [])[-12:] if m.get("role") in ("user", "assistant") and m.get("content")]
+        raw = [m for m in body.get("messages", [])[-12:] if m.get("role") in ("user", "assistant") and m.get("content")]
+        img_base = f"{SUPABASE_URL}/storage/v1/object/public/journal/"
+        msgs = []
+        for m in raw:
+            imgs = [u for u in (m.get("images") or [])[:3] if isinstance(u, str) and u.startswith(img_base)] if m["role"] == "user" else []
+            if imgs:
+                content = [{"type": "image", "source": {"type": "url", "url": u}} for u in imgs] + [{"type": "text", "text": str(m["content"])}]
+            else:
+                content = str(m["content"])
+            msgs.append({"role": m["role"], "content": content})
         if not msgs or msgs[-1]["role"] != "user":
             msgs.append({"role": "user", "content": task or "Hi"})
         r = await client.post("https://api.anthropic.com/v1/messages",
