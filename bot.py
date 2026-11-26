@@ -625,6 +625,26 @@ async def _tell_sam(client: httpx.AsyncClient, text: str) -> None:
             pass
 
 
+# who members can book a 1-1 with
+CALL_HOSTS = {"sam": "Sam", "harley": "Harley"}
+HARLEY_CHAT_ID = os.environ.get("HARLEY_CHAT_ID", "").strip()  # optional: Telegram chat to tell Harley about his calls
+
+
+def _host_name(data: dict) -> str:
+    return CALL_HOSTS.get((data or {}).get("host") or "sam", "Sam")
+
+
+async def _tell_host(client: httpx.AsyncClient, host: str, text: str) -> None:
+    """Tells whoever the call is with. Harley's go to Sam too until HARLEY_CHAT_ID is set."""
+    if host == "harley" and HARLEY_CHAT_ID:
+        try:
+            await client.post(f"{TG_API}/sendMessage", json={"chat_id": HARLEY_CHAT_ID, "text": text})
+        except Exception:
+            pass
+        return
+    await _tell_sam(client, text if host != "harley" else f"(For Harley)\n\n{text}")
+
+
 async def _cal_cancel(client: httpx.AsyncClient, data: dict, reason: str) -> None:
     ev = data.get("calendly_event") or ""
     if CALENDLY_TOKEN and data.get("source") == "calendly" and _cal_uri_ok(ev, "event"):
@@ -780,6 +800,9 @@ async def calls_request(request: Request):
         raise HTTPException(status_code=400, detail="Pick at least one time that's in the future.")
     mins = int(body.get("mins") or 30)
     mins = mins if mins in (20, 30, 45, 60) else 30
+    host = str(body.get("host") or "sam")
+    if host not in CALL_HOSTS:
+        raise HTTPException(status_code=400, detail="Pick who you want to book with.")
     async with httpx.AsyncClient(timeout=30) as client:
         me = await _elite(request, client)
         uid = me["user"]["id"]
@@ -789,17 +812,17 @@ async def calls_request(request: Request):
         for c in mine:
             d = c.get("data") or {}
             if d.get("status") in ("requested", "proposed"):
-                raise HTTPException(status_code=409, detail="You've already asked for a call. I'll get back to you on that one first.")
+                raise HTTPException(status_code=409, detail="You've already asked for a call. Wait for an answer on that one first.")
             if d.get("status") == "booked" and (d.get("at") or "") > now:
                 raise HTTPException(status_code=409, detail="You already have a call booked. Once it's done you can ask for the next one.")
-        data = {"status": "requested", "options": sorted(options), "mins": mins, "topic": topic, "requested_at": now, "source": "request"}
+        data = {"status": "requested", "options": sorted(options), "mins": mins, "topic": topic, "requested_at": now, "source": "request", "host": host}
         made = (await client.post(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**JSON_HDR, "Prefer": "return=representation"},
                                   json={"user_id": uid, "kind": "call", "data": data})).json()
         call = made[0] if isinstance(made, list) and made else None
         if not call:
             raise HTTPException(status_code=500, detail="Couldn't send your request. Try again.")
         name = me["member"].get("name") or me["user"].get("email", "")
-        await _tell_sam(client, f"New 1-1 call request\n\n{name} ({mins} mins)\n" + "\n".join(_uk(o) for o in options) +
+        await _tell_host(client, host, f"New 1-1 call request with {CALL_HOSTS[host]}\n\n{name} ({mins} mins)\n" + "\n".join(_uk(o) for o in options) +
                         f" (UK time)\n\n{topic or 'No topic given'}\n\nAnswer it in Admin > 1-1 Calls.")
         return {"call": _call_out(call)}
 
@@ -821,7 +844,7 @@ async def calls_respond(request: Request):
         data.update({"status": "booked", "booked_at": _now_iso()})
         await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
         name = me["member"].get("name") or me["user"].get("email", "")
-        await _tell_sam(client, f"1-1 call confirmed\n\n{name} said yes to {_uk(data['at'])} (UK time).")
+        await _tell_host(client, data.get("host") or "sam", f"1-1 call confirmed\n\n{name} said yes to {_uk(data['at'])} (UK time).")
         return {"ok": True, "data": data}
 
 
@@ -946,6 +969,7 @@ async def admin_call(request: Request):
                                     params={"id": f"eq.{rows[0]['id']}", "select": "user_id"})).json()[0]["user_id"]
         msg = str(body.get("message") or "").strip()[:1000]
         tell = ""
+        who = _host_name(data)
         if "book_at" in body or "propose_at" in body or "move_at" in body:
             at = _parse_future(body.get("book_at") or body.get("propose_at") or body.get("move_at"))
             if not at:
@@ -954,20 +978,20 @@ async def admin_call(request: Request):
             data["sam_message"] = msg
             if "book_at" in body:
                 data.update({"status": "booked", "booked_at": _now_iso()})
-                tell = f"Your 1-1 call with Sam is booked for {_uk(at)} (UK time). The details are on your 1-1 Calls page."
+                tell = f"Your 1-1 call with {who} is booked for {_uk(at)} (UK time). The details are on your 1-1 Calls page."
             elif "propose_at" in body:
                 data["status"] = "proposed"
-                tell = f"Sam suggested a new time for your 1-1 call: {_uk(at)} (UK time). Say yes on your 1-1 Calls page."
+                tell = f"{who} suggested a new time for your 1-1 call: {_uk(at)} (UK time). Say yes on your 1-1 Calls page."
             else:
                 if data.get("status") != "booked":
                     raise HTTPException(status_code=409, detail="Only booked calls can be moved.")
                 data["moved_at"] = _now_iso()
-                tell = f"Sam moved your 1-1 call to {_uk(at)} (UK time)."
+                tell = f"{who} moved your 1-1 call to {_uk(at)} (UK time)."
             if msg:
                 tell += f"\n\n{msg}"
         if body.get("decline"):
             data.update({"status": "declined", "sam_message": msg, "declined_at": _now_iso()})
-            tell = "Sam can't do the times you asked for." + (f"\n\n{msg}" if msg else "") + "\n\nYou can ask for another time on your 1-1 Calls page."
+            tell = f"{who} can't do the times you asked for." + (f"\n\n{msg}" if msg else "") + "\n\nYou can ask for another time on your 1-1 Calls page."
         for k, cap in (("link", 500), ("notes", 6000), ("recording_link", 1000), ("recording_path", 500)):
             if k in body:
                 data[k] = str(body.get(k) or "").strip()[:cap]
