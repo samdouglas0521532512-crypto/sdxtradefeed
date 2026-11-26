@@ -604,6 +604,16 @@ def _uk(at: str) -> str:
     return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(UK).strftime("%a %d %b, %H:%M")
 
 
+async def _member_name(client: httpx.AsyncClient, user_id: str) -> str:
+    try:
+        u = (await client.get(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", headers=SB_HEADERS)).json()
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/members", headers=SB_HEADERS,
+                                 params={"email": f"ilike.{u.get('email', '')}", "select": "name"})).json()
+        return (rows[0].get("name") if rows else "") or u.get("email", "") or "Member"
+    except Exception:
+        return "Member"
+
+
 async def _tell_member(client: httpx.AsyncClient, user_id: str, text: str) -> None:
     """Best effort: message the member on Telegram if we know their Telegram id."""
     try:
@@ -687,6 +697,115 @@ def _call_out(r: dict) -> dict:
     return {"id": r["id"], "created_at": r.get("created_at"), "data": r.get("data") or {}}
 
 
+# ---------- Zoom: make the meeting when a 1-1 is booked, and save the cloud recording when it's ready ----------
+# Needs a Zoom "Server-to-Server OAuth" app: ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET,
+# and its webhook "Secret Token" as ZOOM_WEBHOOK_SECRET. Cloud recording needs a paid Zoom plan.
+ZOOM_ACCOUNT_ID = os.environ.get("ZOOM_ACCOUNT_ID", "").strip()
+ZOOM_CLIENT_ID = os.environ.get("ZOOM_CLIENT_ID", "").strip()
+ZOOM_CLIENT_SECRET = os.environ.get("ZOOM_CLIENT_SECRET", "").strip()
+ZOOM_WEBHOOK_SECRET = os.environ.get("ZOOM_WEBHOOK_SECRET", "").strip()
+ZOOM_USERS = {"sam": os.environ.get("ZOOM_USER_SAM", "me").strip() or "me",
+              "harley": os.environ.get("ZOOM_USER_HARLEY", "me").strip() or "me"}
+_zoom_tok = {"t": "", "exp": 0.0}
+
+
+def _zoom_on() -> bool:
+    return bool(ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET)
+
+
+async def _zoom_token(client: httpx.AsyncClient) -> str:
+    if _zoom_tok["t"] and _zoom_tok["exp"] > time.time() + 60:
+        return _zoom_tok["t"]
+    r = await client.post("https://zoom.us/oauth/token", params={"grant_type": "account_credentials", "account_id": ZOOM_ACCOUNT_ID},
+                          auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET))
+    j = r.json() if r.status_code == 200 else {}
+    _zoom_tok.update(t=j.get("access_token", ""), exp=time.time() + int(j.get("expires_in", 0) or 0))
+    return _zoom_tok["t"]
+
+
+async def _zoom(client: httpx.AsyncClient, method: str, path: str, body: dict | None = None) -> httpx.Response | None:
+    if not _zoom_on():
+        return None
+    try:
+        tok = await _zoom_token(client)
+        if not tok:
+            return None
+        return await client.request(method, f"https://api.zoom.us/v2{path}", headers={"Authorization": f"Bearer {tok}"}, json=body)
+    except Exception:
+        return None
+
+
+def _zoom_time(at: str) -> str:
+    return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _zoom_make(client: httpx.AsyncClient, data: dict, member_name: str) -> None:
+    """Makes a Zoom meeting for a booked call (recorded to the cloud) and puts the link on the call."""
+    if not _zoom_on() or data.get("link") or data.get("zoom_meeting_id") or not data.get("at"):
+        return
+    host = data.get("host") or "sam"
+    r = await _zoom(client, "POST", f"/users/{ZOOM_USERS.get(host, 'me')}/meetings", {
+        "topic": f"SDX 1-1: {member_name} with {CALL_HOSTS.get(host, 'Sam')}", "type": 2,
+        "start_time": _zoom_time(data["at"]), "duration": int(data.get("mins") or 30), "timezone": "Europe/London",
+        "settings": {"auto_recording": "cloud", "waiting_room": True, "join_before_host": False}})
+    if r is not None and r.status_code in (200, 201):
+        m = r.json()
+        data["link"] = m.get("join_url") or ""
+        data["zoom_meeting_id"] = str(m.get("id") or "")
+
+
+async def _zoom_move(client: httpx.AsyncClient, data: dict) -> None:
+    if data.get("zoom_meeting_id") and data.get("at"):
+        await _zoom(client, "PATCH", f"/meetings/{data['zoom_meeting_id']}", {"start_time": _zoom_time(data["at"]), "timezone": "Europe/London"})
+
+
+async def _zoom_delete(client: httpx.AsyncClient, data: dict) -> None:
+    if data.get("zoom_meeting_id") and (data.get("at") or "") > _now_iso() and not data.get("recording_link"):
+        await _zoom(client, "DELETE", f"/meetings/{data['zoom_meeting_id']}")
+
+
+@app.post("/zoom/webhook")
+async def zoom_webhook(request: Request):
+    """Zoom calls this when a cloud recording is ready. We put the recording on the member's call."""
+    raw = await request.body()
+    try:
+        body = json.loads(raw or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad_json")
+    if not ZOOM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="zoom_not_set_up")
+    if body.get("event") == "endpoint.url_validation":
+        plain = str((body.get("payload") or {}).get("plainToken") or "")
+        return {"plainToken": plain, "encryptedToken": hmac.new(ZOOM_WEBHOOK_SECRET.encode(), plain.encode(), hashlib.sha256).hexdigest()}
+    ts = request.headers.get("x-zm-request-timestamp", "")
+    want = "v0=" + hmac.new(ZOOM_WEBHOOK_SECRET.encode(), f"v0:{ts}:{raw.decode()}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, request.headers.get("x-zm-signature", "")):
+        raise HTTPException(status_code=401, detail="bad_signature")
+    if body.get("event") != "recording.completed":
+        return {"ok": True}
+    obj = (body.get("payload") or {}).get("object") or {}
+    mid = str(obj.get("id") or "")
+    share = str(obj.get("share_url") or "")
+    code = str(obj.get("recording_play_passcode") or "")
+    if not mid or not share:
+        return {"ok": True}
+    link = share + (("&" if "?" in share else "?") + "pwd=" + code if code and "pwd=" not in share else "")
+    async with httpx.AsyncClient(timeout=30) as client:
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"kind": "eq.call", "data->>zoom_meeting_id": f"eq.{mid}", "select": "id,user_id,data"})).json()
+        for r in rows if isinstance(rows, list) else []:
+            data = dict(r.get("data") or {})
+            if data.get("status") == "cancelled":
+                continue
+            data.update({"recording_link": link, "recording_at": _now_iso(), "recording_auto": True})
+            if data.get("status") == "booked":
+                data["status"] = "done"
+            await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{r['id']}"}, json={"data": data})
+            await _tell_member(client, r["user_id"], f"The recording of your 1-1 call with {_host_name(data)} is ready. Watch it on your 1-1 Booking page.")
+            await _tell_host(client, data.get("host") or "sam", "A 1-1 call recording just went up on the dashboard by itself.")
+    return {"ok": True}
+
+
 @app.get("/calls")
 async def calls_mine(request: Request):
     async with httpx.AsyncClient(timeout=30) as client:
@@ -735,6 +854,7 @@ async def calls_book(request: Request):
             raise HTTPException(status_code=409, detail="That time has just gone. Pick another one.")
         data = {"slot_id": slot["id"], "at": slot["data"]["at"], "mins": slot["data"].get("mins") or 30,
                 "link": slot["data"].get("link") or "", "topic": topic, "status": "booked", "booked_at": now}
+        await _zoom_make(client, data, name)
         made = (await client.post(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**JSON_HDR, "Prefer": "return=representation"},
                                   json={"user_id": uid, "kind": "call", "data": data})).json()
         call = made[0] if isinstance(made, list) and made else None
@@ -783,6 +903,7 @@ async def calls_cancel(request: Request):
         if (data.get("at") or "") > _now_iso():
             await _free_slot(client, data.get("slot_id"))
             await _cal_cancel(client, data, "Cancelled from the SDX dashboard")
+            await _zoom_delete(client, data)
         return {"ok": True, "data": data}
 
 
@@ -842,8 +963,9 @@ async def calls_respond(request: Request):
         if (data.get("at") or "") <= _now_iso():
             raise HTTPException(status_code=409, detail="That time has passed. Ask for a new one.")
         data.update({"status": "booked", "booked_at": _now_iso()})
-        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
         name = me["member"].get("name") or me["user"].get("email", "")
+        await _zoom_make(client, data, name)
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
         await _tell_host(client, data.get("host") or "sam", f"1-1 call confirmed\n\n{name} said yes to {_uk(data['at'])} (UK time).")
         return {"ok": True, "data": data}
 
@@ -924,7 +1046,7 @@ async def admin_calls(request: Request):
             out.append(c)
         out.sort(key=lambda c: c["data"].get("at") or "")
         return {"slots": sorted([{"id": s["id"], **(s.get("data") or {})} for s in slots], key=lambda s: s.get("at") or ""),
-                "calls": out, "calendly": bool(CALENDLY_TOKEN)}
+                "calls": out, "calendly": bool(CALENDLY_TOKEN), "zoom": _zoom_on()}
 
 
 @app.post("/admin/call-slots")
@@ -978,6 +1100,8 @@ async def admin_call(request: Request):
             data["sam_message"] = msg
             if "book_at" in body:
                 data.update({"status": "booked", "booked_at": _now_iso()})
+                if not str(body.get("link") or "").strip():
+                    await _zoom_make(client, data, await _member_name(client, uid))
                 tell = f"Your 1-1 call with {who} is booked for {_uk(at)} (UK time). The details are on your 1-1 Calls page."
             elif "propose_at" in body:
                 data["status"] = "proposed"
@@ -986,6 +1110,7 @@ async def admin_call(request: Request):
                 if data.get("status") != "booked":
                     raise HTTPException(status_code=409, detail="Only booked calls can be moved.")
                 data["moved_at"] = _now_iso()
+                await _zoom_move(client, data)
                 tell = f"{who} moved your 1-1 call to {_uk(at)} (UK time)."
             if msg:
                 tell += f"\n\n{msg}"
@@ -1000,6 +1125,7 @@ async def admin_call(request: Request):
                 await _free_slot(client, data.get("slot_id"))
                 if (data.get("at") or "") > _now_iso():
                     await _cal_cancel(client, data, "Cancelled by Sam")
+                    await _zoom_delete(client, data)
             data["status"] = body["status"]
         if (data.get("recording_path") or data.get("recording_link")) and data.get("status") == "booked":
             data["status"] = "done"
