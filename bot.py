@@ -591,6 +591,40 @@ async def _cal_sync(client: httpx.AsyncClient, row: dict) -> dict:
     return data
 
 
+def _parse_future(at: str) -> str | None:
+    try:
+        v = datetime.fromisoformat(str(at or "").replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+    iso = v.isoformat()
+    return iso if iso > _now_iso() else None
+
+
+def _uk(at: str) -> str:
+    return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(UK).strftime("%a %d %b, %H:%M")
+
+
+async def _tell_member(client: httpx.AsyncClient, user_id: str, text: str) -> None:
+    """Best effort: message the member on Telegram if we know their Telegram id."""
+    try:
+        u = (await client.get(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", headers=SB_HEADERS)).json()
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/members", headers=SB_HEADERS,
+                                 params={"email": f"ilike.{u.get('email', '')}", "select": "telegram_id"})).json()
+        tg = rows[0].get("telegram_id") if rows else None
+        if tg:
+            await client.post(f"{TG_API}/sendMessage", json={"chat_id": tg, "text": text})
+    except Exception:
+        pass
+
+
+async def _tell_sam(client: httpx.AsyncClient, text: str) -> None:
+    if SAM_CHAT_ID:
+        try:
+            await client.post(f"{TG_API}/sendMessage", json={"chat_id": SAM_CHAT_ID, "text": text})
+        except Exception:
+            pass
+
+
 async def _cal_cancel(client: httpx.AsyncClient, data: dict, reason: str) -> None:
     ev = data.get("calendly_event") or ""
     if CALENDLY_TOKEN and data.get("source") == "calendly" and _cal_uri_ok(ev, "event"):
@@ -718,13 +752,76 @@ async def calls_cancel(request: Request):
         rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
                                  params={"id": f"eq.{body.get('id', '')}", "kind": "eq.call",
                                          "user_id": f"eq.{me['user']['id']}", "select": "id,data"})).json()
-        if not rows or rows[0]["data"].get("status") != "booked":
+        if not rows or rows[0]["data"].get("status") not in ("booked", "requested", "proposed"):
             raise HTTPException(status_code=404, detail="not_found")
+        was = rows[0]["data"].get("status")
         data = {**rows[0]["data"], "status": "cancelled", "cancelled_at": _now_iso()}
+        if was in ("requested", "proposed"):
+            await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+            return {"ok": True, "data": data}
         await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
         if (data.get("at") or "") > _now_iso():
             await _free_slot(client, data.get("slot_id"))
             await _cal_cancel(client, data, "Cancelled from the SDX dashboard")
+        return {"ok": True, "data": data}
+
+
+@app.post("/calls/request")
+async def calls_request(request: Request):
+    """An Elite member asks for a call and suggests up to three times. Sam books one, suggests another, or declines."""
+    body = await request.json()
+    topic = str(body.get("topic") or "").strip()[:2000]
+    options = []
+    for o in (body.get("options") or [])[:3]:
+        v = _parse_future(o)
+        if v and v not in options:
+            options.append(v)
+    if not options:
+        raise HTTPException(status_code=400, detail="Pick at least one time that's in the future.")
+    mins = int(body.get("mins") or 30)
+    mins = mins if mins in (20, 30, 45, 60) else 30
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _elite(request, client)
+        uid = me["user"]["id"]
+        now = _now_iso()
+        mine = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"select": "id,data", "kind": "eq.call", "user_id": f"eq.{uid}"})).json()
+        for c in mine:
+            d = c.get("data") or {}
+            if d.get("status") in ("requested", "proposed"):
+                raise HTTPException(status_code=409, detail="You've already asked for a call. I'll get back to you on that one first.")
+            if d.get("status") == "booked" and (d.get("at") or "") > now:
+                raise HTTPException(status_code=409, detail="You already have a call booked. Once it's done you can ask for the next one.")
+        data = {"status": "requested", "options": sorted(options), "mins": mins, "topic": topic, "requested_at": now, "source": "request"}
+        made = (await client.post(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**JSON_HDR, "Prefer": "return=representation"},
+                                  json={"user_id": uid, "kind": "call", "data": data})).json()
+        call = made[0] if isinstance(made, list) and made else None
+        if not call:
+            raise HTTPException(status_code=500, detail="Couldn't send your request. Try again.")
+        name = me["member"].get("name") or me["user"].get("email", "")
+        await _tell_sam(client, f"New 1-1 call request\n\n{name} ({mins} mins)\n" + "\n".join(_uk(o) for o in options) +
+                        f" (UK time)\n\n{topic or 'No topic given'}\n\nAnswer it in Admin > 1-1 Calls.")
+        return {"call": _call_out(call)}
+
+
+@app.post("/calls/respond")
+async def calls_respond(request: Request):
+    """The member says yes to the time Sam suggested."""
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _elite(request, client)
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{body.get('id', '')}", "kind": "eq.call",
+                                         "user_id": f"eq.{me['user']['id']}", "select": "id,data"})).json()
+        if not rows or rows[0]["data"].get("status") != "proposed":
+            raise HTTPException(status_code=404, detail="not_found")
+        data = dict(rows[0]["data"])
+        if (data.get("at") or "") <= _now_iso():
+            raise HTTPException(status_code=409, detail="That time has passed. Ask for a new one.")
+        data.update({"status": "booked", "booked_at": _now_iso()})
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+        name = me["member"].get("name") or me["user"].get("email", "")
+        await _tell_sam(client, f"1-1 call confirmed\n\n{name} said yes to {_uk(data['at'])} (UK time).")
         return {"ok": True, "data": data}
 
 
@@ -843,6 +940,34 @@ async def admin_call(request: Request):
         if not rows:
             raise HTTPException(status_code=404, detail="not_found")
         data = dict(rows[0].get("data") or {})
+        uid = None
+        if any(k in body for k in ("book_at", "propose_at", "move_at", "decline")):
+            uid = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                    params={"id": f"eq.{rows[0]['id']}", "select": "user_id"})).json()[0]["user_id"]
+        msg = str(body.get("message") or "").strip()[:1000]
+        tell = ""
+        if "book_at" in body or "propose_at" in body or "move_at" in body:
+            at = _parse_future(body.get("book_at") or body.get("propose_at") or body.get("move_at"))
+            if not at:
+                raise HTTPException(status_code=400, detail="Pick a time in the future.")
+            data["at"] = at
+            data["sam_message"] = msg
+            if "book_at" in body:
+                data.update({"status": "booked", "booked_at": _now_iso()})
+                tell = f"Your 1-1 call with Sam is booked for {_uk(at)} (UK time). The details are on your 1-1 Calls page."
+            elif "propose_at" in body:
+                data["status"] = "proposed"
+                tell = f"Sam suggested a new time for your 1-1 call: {_uk(at)} (UK time). Say yes on your 1-1 Calls page."
+            else:
+                if data.get("status") != "booked":
+                    raise HTTPException(status_code=409, detail="Only booked calls can be moved.")
+                data["moved_at"] = _now_iso()
+                tell = f"Sam moved your 1-1 call to {_uk(at)} (UK time)."
+            if msg:
+                tell += f"\n\n{msg}"
+        if body.get("decline"):
+            data.update({"status": "declined", "sam_message": msg, "declined_at": _now_iso()})
+            tell = "Sam can't do the times you asked for." + (f"\n\n{msg}" if msg else "") + "\n\nYou can ask for another time on your 1-1 Calls page."
         for k, cap in (("link", 500), ("notes", 6000), ("recording_link", 1000), ("recording_path", 500)):
             if k in body:
                 data[k] = str(body.get(k) or "").strip()[:cap]
@@ -858,6 +983,8 @@ async def admin_call(request: Request):
             data["recording_at"] = _now_iso()
         data.pop("recording_url", None)
         await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+        if tell and uid:
+            await _tell_member(client, uid, tell)
         if data.get("recording_path"):
             data["recording_url"] = await _signed_recording(client, data["recording_path"])
         return {"ok": True, "data": data}
