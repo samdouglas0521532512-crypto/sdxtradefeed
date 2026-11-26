@@ -511,6 +511,94 @@ CALL_BUCKET = os.environ.get("CALL_BUCKET", "call-recordings")
 SAM_CHAT_ID = os.environ.get("SAM_CHAT_ID", "").strip()  # optional: Telegram chat to tell Sam about bookings
 JSON_HDR = {**SB_HEADERS, "Content-Type": "application/json"}
 
+# Calendly: members book 1-1 calls on Sam's Calendly page, inside the dashboard.
+# CALENDLY_TOKEN is a Calendly personal access token (Calendly > Integrations > API and webhooks).
+CALENDLY_TOKEN = os.environ.get("CALENDLY_TOKEN", "").strip()
+CALENDLY_API = "https://api.calendly.com"
+
+
+def _cal_headers() -> dict:
+    return {"Authorization": f"Bearer {CALENDLY_TOKEN}", "Content-Type": "application/json"}
+
+
+def _cal_uri_ok(uri: str, kind: str) -> bool:
+    if kind == "event":
+        return bool(re.fullmatch(r"https://api\.calendly\.com/scheduled_events/[A-Za-z0-9-]+", uri or ""))
+    return bool(re.fullmatch(r"https://api\.calendly\.com/scheduled_events/[A-Za-z0-9-]+/invitees/[A-Za-z0-9-]+", uri or ""))
+
+
+async def _cal_get(client: httpx.AsyncClient, uri: str) -> dict | None:
+    r = await client.get(uri, headers=_cal_headers())
+    if r.status_code != 200:
+        return None
+    return (r.json() or {}).get("resource")
+
+
+def _cal_event_of(invitee_uri: str) -> str:
+    return invitee_uri.split("/invitees/")[0]
+
+
+def _cal_fields(ev: dict, inv: dict) -> dict:
+    """The bits of a Calendly booking we keep on the call."""
+    start = ev.get("start_time") or ""
+    end = ev.get("end_time") or ""
+    try:
+        mins = int((datetime.fromisoformat(end.replace("Z", "+00:00")) - datetime.fromisoformat(start.replace("Z", "+00:00"))).total_seconds() // 60)
+    except ValueError:
+        mins = 30
+    loc = ev.get("location") or {}
+    link = loc.get("join_url") or (loc.get("location") if str(loc.get("location") or "").startswith("http") else "") or ""
+    at = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat() if start else ""
+    return {"at": at, "mins": mins or 30, "link": str(link)[:500],
+            "calendly_event": ev.get("uri") or "", "calendly_invitee": inv.get("uri") or "",
+            "cancel_url": inv.get("cancel_url") or "", "reschedule_url": inv.get("reschedule_url") or ""}
+
+
+async def _cal_sync(client: httpx.AsyncClient, row: dict) -> dict:
+    """Brings a Calendly-booked call up to date: new time if they rescheduled, cancelled if they cancelled, the call link once it exists."""
+    data = dict(row.get("data") or {})
+    if not CALENDLY_TOKEN or data.get("source") != "calendly" or data.get("status") != "booked":
+        return data
+    if (data.get("at") or "") <= _now_iso():
+        return data
+    inv = await _cal_get(client, data.get("calendly_invitee") or "")
+    if not inv:
+        return data
+    changed = False
+    hops = 0
+    while inv.get("status") == "canceled" and inv.get("rescheduled") and inv.get("new_invitee") and hops < 5:
+        nxt = await _cal_get(client, inv["new_invitee"])
+        if not nxt:
+            break
+        inv = nxt
+        hops += 1
+    ev = await _cal_get(client, _cal_event_of(inv.get("uri") or "")) if inv.get("uri") else None
+    if inv.get("status") == "canceled" or (ev and ev.get("status") == "canceled"):
+        data["status"] = "cancelled"
+        data["cancelled_at"] = _now_iso()
+        changed = True
+    elif ev:
+        fresh = _cal_fields(ev, inv)
+        if fresh["calendly_event"] != data.get("calendly_event"):
+            data.update(fresh)  # rescheduled: new time, new link
+            changed = True
+        for k, v in fresh.items():
+            if v and data.get(k) != v:
+                data[k] = v
+                changed = True
+    if changed:
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{row['id']}"}, json={"data": data})
+    return data
+
+
+async def _cal_cancel(client: httpx.AsyncClient, data: dict, reason: str) -> None:
+    ev = data.get("calendly_event") or ""
+    if CALENDLY_TOKEN and data.get("source") == "calendly" and _cal_uri_ok(ev, "event"):
+        try:
+            await client.post(f"{ev}/cancellation", headers=_cal_headers(), json={"reason": reason})
+        except Exception:
+            pass
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -559,11 +647,12 @@ async def calls_mine(request: Request):
                                          "user_id": f"eq.{me['user']['id']}", "order": "created_at.desc"})).json()
         out = []
         for r in mine:
+            r["data"] = await _cal_sync(client, r)
             c = _call_out(r)
             if c["data"].get("recording_path"):
                 c["data"]["recording_url"] = await _signed_recording(client, c["data"]["recording_path"])
             out.append(c)
-        return {"slots": open_slots, "calls": out}
+        return {"slots": open_slots, "calls": out, "calendly": bool(CALENDLY_TOKEN)}
 
 
 @app.post("/calls/book")
@@ -635,7 +724,60 @@ async def calls_cancel(request: Request):
         await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
         if (data.get("at") or "") > _now_iso():
             await _free_slot(client, data.get("slot_id"))
+            await _cal_cancel(client, data, "Cancelled from the SDX dashboard")
         return {"ok": True, "data": data}
+
+
+@app.post("/calls/calendly")
+async def calls_calendly(request: Request):
+    """Saves a call the member just booked on Calendly inside the dashboard."""
+    body = await request.json()
+    ev_uri = str(body.get("event_uri") or "")
+    inv_uri = str(body.get("invitee_uri") or "")
+    topic = str(body.get("topic") or "").strip()[:2000]
+    if not CALENDLY_TOKEN:
+        raise HTTPException(status_code=503, detail="Calendly isn't connected yet.")
+    if not _cal_uri_ok(ev_uri, "event") or not _cal_uri_ok(inv_uri, "invitee") or _cal_event_of(inv_uri) != ev_uri:
+        raise HTTPException(status_code=400, detail="bad_booking")
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _elite(request, client)
+        uid = me["user"]["id"]
+        mine = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"select": "id,data,created_at", "kind": "eq.call", "user_id": f"eq.{uid}"})).json()
+        for c in mine:
+            if (c.get("data") or {}).get("calendly_invitee") == inv_uri:
+                return {"call": _call_out(c)}
+        ev = await _cal_get(client, ev_uri)
+        inv = await _cal_get(client, inv_uri)
+        if not ev or not inv:
+            raise HTTPException(status_code=404, detail="Couldn't find that booking on Calendly.")
+        # only save bookings made just now, or made with this member's own email
+        email_ok = (inv.get("email") or "").lower() == (me["user"].get("email") or "").lower()
+        try:
+            fresh = (datetime.now(timezone.utc) - datetime.fromisoformat((inv.get("created_at") or "").replace("Z", "+00:00"))).total_seconds() < 1800
+        except ValueError:
+            fresh = False
+        if not (email_ok or fresh):
+            raise HTTPException(status_code=403, detail="That booking isn't yours.")
+        if not topic:
+            qa = inv.get("questions_and_answers") or []
+            topic = "\n".join(str(q.get("answer") or "") for q in qa if q.get("answer")).strip()[:2000]
+        now = _now_iso()
+        data = {**_cal_fields(ev, inv), "topic": topic, "status": "booked", "booked_at": now, "source": "calendly"}
+        made = (await client.post(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**JSON_HDR, "Prefer": "return=representation"},
+                                  json={"user_id": uid, "kind": "call", "data": data})).json()
+        call = made[0] if isinstance(made, list) and made else None
+        if not call:
+            raise HTTPException(status_code=500, detail="Booked on Calendly, but couldn't save it to your dashboard. Refresh the page.")
+        if SAM_CHAT_ID:
+            try:
+                name = me["member"].get("name") or me["user"].get("email", "")
+                when = datetime.fromisoformat(data["at"].replace("Z", "+00:00")).astimezone(UK).strftime("%a %d %b, %H:%M")
+                await client.post(f"{TG_API}/sendMessage", json={"chat_id": SAM_CHAT_ID,
+                                  "text": f"New 1-1 call booked (Calendly)\n\n{name}\n{when} (UK time)\n\n{topic or 'No topic given'}"})
+            except Exception:
+                pass
+        return {"call": _call_out(call)}
 
 
 @app.get("/admin/calls")
@@ -652,6 +794,7 @@ async def admin_calls(request: Request):
         name_by_email = {(m.get("email") or "").lower(): m.get("name") for m in members}
         out = []
         for r in calls:
+            r["data"] = await _cal_sync(client, r)
             em = email_by_id.get(r["user_id"], "")
             c = _call_out(r)
             c["email"] = em
@@ -661,7 +804,7 @@ async def admin_calls(request: Request):
             out.append(c)
         out.sort(key=lambda c: c["data"].get("at") or "")
         return {"slots": sorted([{"id": s["id"], **(s.get("data") or {})} for s in slots], key=lambda s: s.get("at") or ""),
-                "calls": out}
+                "calls": out, "calendly": bool(CALENDLY_TOKEN)}
 
 
 @app.post("/admin/call-slots")
@@ -706,6 +849,8 @@ async def admin_call(request: Request):
         if body.get("status") in ("booked", "done", "cancelled"):
             if body["status"] == "cancelled" and data.get("status") != "cancelled":
                 await _free_slot(client, data.get("slot_id"))
+                if (data.get("at") or "") > _now_iso():
+                    await _cal_cancel(client, data, "Cancelled by Sam")
             data["status"] = body["status"]
         if (data.get("recording_path") or data.get("recording_link")) and data.get("status") == "booked":
             data["status"] = "done"
