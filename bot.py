@@ -506,6 +506,235 @@ async def admin_trade_review(request: Request):
         return {"ok": True, "data": data}
 
 
+# ---------- 1-1 calls: Sam opens slots, Elite members book, Sam adds the recording ----------
+CALL_BUCKET = os.environ.get("CALL_BUCKET", "call-recordings")
+SAM_CHAT_ID = os.environ.get("SAM_CHAT_ID", "").strip()  # optional: Telegram chat to tell Sam about bookings
+JSON_HDR = {**SB_HEADERS, "Content-Type": "application/json"}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _elite(request: Request, client: httpx.AsyncClient) -> dict:
+    me = await current_member(request, client)
+    if me["member"].get("plan") not in ("Elite Pack", "Admin"):
+        raise HTTPException(status_code=403, detail="elite_only")
+    return me
+
+
+async def _admin(request: Request, client: httpx.AsyncClient) -> dict:
+    me = await current_member(request, client)
+    if me["member"].get("plan") != "Admin":
+        raise HTTPException(status_code=403, detail="admins_only")
+    return me
+
+
+async def _signed_recording(client: httpx.AsyncClient, path: str) -> str | None:
+    if not path:
+        return None
+    r = await client.post(f"{SUPABASE_URL}/storage/v1/object/sign/{CALL_BUCKET}/{path}", headers=JSON_HDR,
+                          json={"expiresIn": 6 * 3600})
+    if r.status_code != 200:
+        return None
+    u = r.json().get("signedURL") or r.json().get("signedUrl") or ""
+    return f"{SUPABASE_URL}/storage/v1{u}" if u.startswith("/") else u or None
+
+
+def _call_out(r: dict) -> dict:
+    return {"id": r["id"], "created_at": r.get("created_at"), "data": r.get("data") or {}}
+
+
+@app.get("/calls")
+async def calls_mine(request: Request):
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _elite(request, client)
+        now = _now_iso()
+        slots = await sb_all(client, "journal_items", {"select": "id,data", "kind": "eq.call_slot"})
+        open_slots = sorted([{"id": s["id"], "at": s["data"].get("at"), "mins": s["data"].get("mins") or 30}
+                             for s in slots if (s.get("data") or {}).get("at", "") > now and not s["data"].get("booked")],
+                            key=lambda x: x["at"])
+        mine = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"select": "id,data,created_at", "kind": "eq.call",
+                                         "user_id": f"eq.{me['user']['id']}", "order": "created_at.desc"})).json()
+        out = []
+        for r in mine:
+            c = _call_out(r)
+            if c["data"].get("recording_path"):
+                c["data"]["recording_url"] = await _signed_recording(client, c["data"]["recording_path"])
+            out.append(c)
+        return {"slots": open_slots, "calls": out}
+
+
+@app.post("/calls/book")
+async def calls_book(request: Request):
+    body = await request.json()
+    topic = str(body.get("topic") or "").strip()[:2000]
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _elite(request, client)
+        uid = me["user"]["id"]
+        now = _now_iso()
+        mine = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"select": "id,data", "kind": "eq.call", "user_id": f"eq.{uid}"})).json()
+        if any((c.get("data") or {}).get("status") == "booked" and (c["data"].get("at") or "") > now for c in mine):
+            raise HTTPException(status_code=409, detail="You already have a call booked. Once it's done you can book the next one.")
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{body.get('slot_id', '')}", "kind": "eq.call_slot", "select": "id,data"})).json()
+        if not rows or rows[0]["data"].get("booked") or (rows[0]["data"].get("at") or "") <= now:
+            raise HTTPException(status_code=409, detail="That time has just gone. Pick another one.")
+        slot = rows[0]
+        name = me["member"].get("name") or me["user"].get("email", "")
+        # claim the slot only if nobody else has (stops two people booking the same time)
+        claimed = (await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**JSON_HDR, "Prefer": "return=representation"},
+                                      params={"id": f"eq.{slot['id']}", "data->>booked": "is.null"},
+                                      json={"data": {**slot["data"], "booked": True, "user_id": uid, "name": name}})).json()
+        if not claimed:
+            raise HTTPException(status_code=409, detail="That time has just gone. Pick another one.")
+        data = {"slot_id": slot["id"], "at": slot["data"]["at"], "mins": slot["data"].get("mins") or 30,
+                "link": slot["data"].get("link") or "", "topic": topic, "status": "booked", "booked_at": now}
+        made = (await client.post(f"{SUPABASE_URL}/rest/v1/journal_items", headers={**JSON_HDR, "Prefer": "return=representation"},
+                                  json={"user_id": uid, "kind": "call", "data": data})).json()
+        call = made[0] if isinstance(made, list) and made else None
+        if not call:
+            await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{slot['id']}"},
+                               json={"data": slot["data"]})
+            raise HTTPException(status_code=500, detail="Couldn't book the call. Try again.")
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{slot['id']}"},
+                           json={"data": {**slot["data"], "booked": True, "user_id": uid, "name": name, "call_id": call["id"]}})
+        if SAM_CHAT_ID:
+            try:
+                when = datetime.fromisoformat(data["at"].replace("Z", "+00:00")).astimezone(UK).strftime("%a %d %b, %H:%M")
+                await client.post(f"{TG_API}/sendMessage", json={"chat_id": SAM_CHAT_ID,
+                                  "text": f"New 1-1 call booked\n\n{name}\n{when} (UK time)\n\n{topic or 'No topic given'}"})
+            except Exception:
+                pass
+        return {"call": _call_out(call)}
+
+
+async def _free_slot(client: httpx.AsyncClient, slot_id) -> None:
+    if not slot_id:
+        return
+    rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                             params={"id": f"eq.{slot_id}", "kind": "eq.call_slot", "select": "id,data"})).json()
+    if rows:
+        d = {k: v for k, v in (rows[0].get("data") or {}).items() if k not in ("booked", "user_id", "name", "call_id")}
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{slot_id}"}, json={"data": d})
+
+
+@app.post("/calls/cancel")
+async def calls_cancel(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _elite(request, client)
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{body.get('id', '')}", "kind": "eq.call",
+                                         "user_id": f"eq.{me['user']['id']}", "select": "id,data"})).json()
+        if not rows or rows[0]["data"].get("status") != "booked":
+            raise HTTPException(status_code=404, detail="not_found")
+        data = {**rows[0]["data"], "status": "cancelled", "cancelled_at": _now_iso()}
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+        if (data.get("at") or "") > _now_iso():
+            await _free_slot(client, data.get("slot_id"))
+        return {"ok": True, "data": data}
+
+
+@app.get("/admin/calls")
+async def admin_calls(request: Request):
+    async with httpx.AsyncClient(timeout=30) as client:
+        await _admin(request, client)
+        slots = await sb_all(client, "journal_items", {"select": "id,data", "kind": "eq.call_slot"})
+        calls = await sb_all(client, "journal_items", {"select": "id,user_id,data,created_at", "kind": "eq.call"})
+        users = (await client.get(f"{SUPABASE_URL}/auth/v1/admin/users", headers=SB_HEADERS,
+                                  params={"per_page": "1000"})).json().get("users", [])
+        email_by_id = {u["id"]: (u.get("email") or "") for u in users}
+        members = (await client.get(f"{SUPABASE_URL}/rest/v1/members", headers=SB_HEADERS,
+                                    params={"select": "email,name"})).json()
+        name_by_email = {(m.get("email") or "").lower(): m.get("name") for m in members}
+        out = []
+        for r in calls:
+            em = email_by_id.get(r["user_id"], "")
+            c = _call_out(r)
+            c["email"] = em
+            c["name"] = name_by_email.get(em.lower()) or em
+            if c["data"].get("recording_path"):
+                c["data"]["recording_url"] = await _signed_recording(client, c["data"]["recording_path"])
+            out.append(c)
+        out.sort(key=lambda c: c["data"].get("at") or "")
+        return {"slots": sorted([{"id": s["id"], **(s.get("data") or {})} for s in slots], key=lambda s: s.get("at") or ""),
+                "calls": out}
+
+
+@app.post("/admin/call-slots")
+async def admin_call_slots(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        me = await _admin(request, client)
+        now = _now_iso()
+        add = []
+        for s in (body.get("add") or [])[:60]:
+            at = str(s.get("at") or "")
+            try:
+                at = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+            except ValueError:
+                continue
+            if at <= now:
+                continue
+            mins = int(s.get("mins") or 30)
+            add.append({"user_id": me["user"]["id"], "kind": "call_slot",
+                        "data": {"at": at, "mins": max(10, min(mins, 180)), "link": str(s.get("link") or "").strip()[:500]}})
+        if add:
+            await client.post(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, json=add)
+        for sid in (body.get("remove") or [])[:100]:
+            await client.request("DELETE", f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{sid}", "kind": "eq.call_slot", "data->>booked": "is.null"})
+        return {"ok": True, "added": len(add)}
+
+
+@app.post("/admin/call")
+async def admin_call(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        await _admin(request, client)
+        rows = (await client.get(f"{SUPABASE_URL}/rest/v1/journal_items", headers=SB_HEADERS,
+                                 params={"id": f"eq.{body.get('id', '')}", "kind": "eq.call", "select": "id,data"})).json()
+        if not rows:
+            raise HTTPException(status_code=404, detail="not_found")
+        data = dict(rows[0].get("data") or {})
+        for k, cap in (("link", 500), ("notes", 6000), ("recording_link", 1000), ("recording_path", 500)):
+            if k in body:
+                data[k] = str(body.get(k) or "").strip()[:cap]
+        if body.get("status") in ("booked", "done", "cancelled"):
+            if body["status"] == "cancelled" and data.get("status") != "cancelled":
+                await _free_slot(client, data.get("slot_id"))
+            data["status"] = body["status"]
+        if (data.get("recording_path") or data.get("recording_link")) and data.get("status") == "booked":
+            data["status"] = "done"
+        if "recording_path" in body or "recording_link" in body:
+            data["recording_at"] = _now_iso()
+        data.pop("recording_url", None)
+        await client.patch(f"{SUPABASE_URL}/rest/v1/journal_items", headers=JSON_HDR, params={"id": f"eq.{rows[0]['id']}"}, json={"data": data})
+        if data.get("recording_path"):
+            data["recording_url"] = await _signed_recording(client, data["recording_path"])
+        return {"ok": True, "data": data}
+
+
+@app.post("/admin/call-upload")
+async def admin_call_upload(request: Request):
+    """Gives the dashboard a one-off link to upload a call recording straight into a private bucket."""
+    body = await request.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        await _admin(request, client)
+        await client.post(f"{SUPABASE_URL}/storage/v1/bucket", headers=JSON_HDR,
+                          json={"id": CALL_BUCKET, "name": CALL_BUCKET, "public": False})  # already there = harmless error
+        safe = re.sub(r"[^a-zA-Z0-9._-]", "_", str(body.get("filename") or "recording.mp4"))[-80:]
+        path = f"{body.get('id', 'call')}/{int(time.time())}-{safe}"
+        r = await client.post(f"{SUPABASE_URL}/storage/v1/object/upload/sign/{CALL_BUCKET}/{path}", headers=JSON_HDR, json={})
+        if r.status_code != 200:
+            raise HTTPException(status_code=500, detail="Couldn't start the upload.")
+        url = r.json().get("url") or ""
+        token = url.split("token=")[-1] if "token=" in url else ""
+        return {"bucket": CALL_BUCKET, "path": path, "token": token}
+
 @app.post("/admin/access")
 async def admin_access(request: Request):
     body = await request.json()
